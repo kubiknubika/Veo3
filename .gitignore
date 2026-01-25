@@ -28,3 +28,6 @@ output/
 run.bat
 run_tests.bat
 run_api_tests.bat
+
+# Internal Documentation
+Documentation/

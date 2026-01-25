@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import cv2
 import asyncio
@@ -21,7 +22,13 @@ class Config:
     MODEL_AUDIO = "models/lyria-realtime-exp"
     TOKEN_LIMIT = 1000
     
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    if getattr(sys, 'frozen', False):
+        # Running as compiled exe: use directory of the executable
+        BASE_DIR = os.path.dirname(sys.executable)
+    else:
+        # Running as script: use directory of the script
+        BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
     OUTPUT_DIRS = {
         "video": os.path.join(BASE_DIR, "output", "videos"),
         "image": os.path.join(BASE_DIR, "output", "images"),
@@ -208,12 +215,31 @@ class GenAIService:
 
             config = types.GenerateVideosConfig(**config_params)
 
-            operation = self.client.models.generate_videos(
-                model=Config.MODEL_VIDEO,
-                prompt=prompt,
-                image=image_param,
-                config=config
-            )
+            # Try to generate with person_generation first
+            try:
+                operation = self.client.models.generate_videos(
+                    model=Config.MODEL_VIDEO,
+                    prompt=prompt,
+                    image=image_param,
+                    config=config
+                )
+            except Exception as e:
+                err_str = str(e)
+                if "INVALID_ARGUMENT" in err_str and ("personGeneration" in err_str or "allow_adult" in err_str):
+                    print("Ошибка аргумента person_generation. Повторяем запрос без него...")
+                    # Remove person_generation and retry
+                    if "person_generation" in config_params:
+                        del config_params["person_generation"]
+                    
+                    config = types.GenerateVideosConfig(**config_params)
+                    operation = self.client.models.generate_videos(
+                        model=Config.MODEL_VIDEO,
+                        prompt=prompt,
+                        image=image_param,
+                        config=config
+                    )
+                else:
+                    raise e
 
             print("Ожидание генерации...")
             while not operation.done:
