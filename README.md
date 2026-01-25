@@ -32,7 +32,7 @@ python veo_generator.py
 
 ## ✨ Features
 
-*   **Text-to-Video (Veo 3.1)**: Generate high-quality videos with resolution control (720p/1080p).
+*   **Text-to-Video (Veo 3.1)**: Generate high-quality videos with resolution control (720p/1080p/4k).
 *   **Image Generation (Imagen 4 / NanoBanana)**: Create start/end frames or standalone art.
 *   **Audio Generation (Lyria)**: Experimental model, currently generates low quality audio. For high quality audio, please use third-party models.
 *   **Video Chaining**: Create long sequences where the last frame of one video becomes the start of the next.
@@ -49,9 +49,9 @@ Major refactoring and feature expansion compared to the initial version:
 *   **Conflict Resolution**: Automatic file renaming (incrementing counters) and safe cleanup of temporary files.
 
 ### 2. 🎬 Advanced Video Control
-*   **Resolution Selection**: Choose between **720p** (quota-friendly) and **1080p** (HD).
+*   **Resolution Selection**: Choose between **720p**, **1080p** and **4k** (UHD).
 *   **Negative Prompts**: Added support for negative prompts.
-    *   *Auto-Generate*: If left empty, the system uses **Gemini 2.0 Flash** to analyze your prompt and generate a relevant negative prompt automatically.
+    *   *Auto-Generate*: If left empty, the system uses **Gemini 3.0 Flash** to analyze your prompt and generate a relevant negative prompt automatically.
 *   **Constraints**:
     *   **Last Frame**: Force a specific ending image (from file or generated on the fly).
     *   **Reference Images**: Upload up to 3 images to guide style and content.

@@ -17,7 +17,7 @@ load_dotenv()
 class Config:
     MODEL_VIDEO = "veo-3.1-generate-preview"
     MODEL_IMAGE = "gemini-2.5-flash-image"
-    MODEL_TEXT = "gemini-2.0-flash"
+    MODEL_TEXT = "gemini-3.0-flash-preview"
     MODEL_AUDIO = "models/lyria-realtime-exp"
     TOKEN_LIMIT = 1000
     
@@ -326,10 +326,10 @@ class VeoGeneratorApp:
         print("Разрешение:")
         print("1. 720p (Быстро, меньше квоты)")
         print("2. 1080p (HD)")
-        # print("3. 4k (UHD - if supported)") 
+        print("3. 4k (UHD)") 
         c = input("Выбор (1): ")
         if c == "2": return "1080p"
-        # if c == "3": return "4k"
+        if c == "3": return "4k"
         return "720p"
 
     def _configure_advanced_options(self, prompt):
