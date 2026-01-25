@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Environment Variables
+.env
+
+# Output files (generated content)
+output/
+*.mp4
+*.png
+*.wav
+*.jpg
+*.jpeg
+
+# Editor
+.vscode/
