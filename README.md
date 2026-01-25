@@ -22,13 +22,13 @@ Advanced AI Media Generation tool powered by Google Gemini (Veo 3.1, Imagen 4, L
 
 ## ▶️ Usage
 
-Run the main application using the provided batch file (Windows) or directly via Python:
+Run the main application using Python:
 
 ```powershell
-.\run.bat
-# or
 python veo_generator.py
 ```
+
+*Note: You may want to create a `run.bat` or `run.sh` script locally to execute this with your specific Python environment path if needed.*
 
 ## ✨ Features
 
