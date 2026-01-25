@@ -1,6 +1,6 @@
 # Veo3 Pro Generator
 
-Advanced AI Media Generation tool powered by Google Gemini (Veo, Imagen 3, Lyria). This tool allows you to generate videos, images, and audio, link them into chains, create smooth transitions (bridges), and manage your media workflow efficiently.
+Advanced AI Media Generation tool powered by Google Gemini (Veo 3.1, Imagen 4, Lyria). This tool allows you to generate videos, images, and audio, link them into chains, create smooth transitions (bridges), and manage your media workflow efficiently.
 
 ## 🚀 Installation & Setup
 
@@ -33,8 +33,8 @@ python veo_generator.py
 ## ✨ Features
 
 *   **Text-to-Video (Veo 3.1)**: Generate high-quality videos with resolution control (720p/1080p).
-*   **Image Generation (Imagen 3 / NanoBanana)**: Create start/end frames or standalone art.
-*   **Audio Generation (Lyria)**: Generate background music or sound effects.
+*   **Image Generation (Imagen 4 / NanoBanana)**: Create start/end frames or standalone art.
+*   **Audio Generation (Lyria)**: Experimental model, currently generates low quality audio. For high quality audio, please use third-party models.
 *   **Video Chaining**: Create long sequences where the last frame of one video becomes the start of the next.
 *   **Bridge & Interpolation**: Smoothly connect two video clips (existing or generated) with a generated transition. Includes a **Verification Loop** to perfect the result.
 *   **Batch Processing**: Generate multiple videos from a list of prompts or concatenate existing files.
