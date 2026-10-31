@@ -140,28 +140,35 @@ def get_api_key() -> str:
     return (os.environ.get("GEMINI_API_KEY") or "").strip()
 
 
-def validate_api_key(key: Optional[str] = None) -> str:
+def validate_api_key(key: Optional[str] = None, source: Optional[str] = None) -> str:
     """Return the API key or raise :class:`ApiKeyError` early at startup.
 
     Performs an offline format check only (Google AI Studio keys are 35+
     chars starting with ``AIza``); use :func:`check_api_key_connectivity`
     for a live network validation that costs no quota.
+
+    ``source`` optionally names where the key came from (e.g. ``"GUI input"``)
+    so error messages can point at the right place — when the app was started
+    without a key, the GUI simply asks for one in a dialog instead of exiting.
     """
     key = get_api_key() if key is None else (key or "").strip()
+    where = f" ({source})" if source else ""
     if not key:
         raise ApiKeyError(
-            "GEMINI_API_KEY is not set. Enter it in the GUI (Settings/API-key "
-            "dialog) or create a .env file with GEMINI_API_KEY=your_key"
+            f"GEMINI_API_KEY is not set{where}. Paste your Google AI Studio key "
+            "into the API-key window and press Save — it will be stored in the "
+            ".env file next to the app and reused on the next launch "
+            "(get a key at https://aistudio.google.com/apikey)."
         )
     placeholders = ("your_", "placeholder", "xxx", "changeme", "insert")
     if any(p in key.lower() for p in placeholders) or len(key) < 20:
         raise ApiKeyError(
-            "GEMINI_API_KEY looks like a placeholder or is too short. "
+            f"GEMINI_API_KEY{where} looks like a placeholder or is too short. "
             "Get a real key at https://aistudio.google.com/apikey"
         )
     if key.startswith("AIza") and len(key) < 35:
         raise ApiKeyError(
-            f"GEMINI_API_KEY has an invalid length ({len(key)}); "
+            f"GEMINI_API_KEY{where} has an invalid length ({len(key)}); "
             "Google API keys are 35+ characters. Check for truncation."
         )
     return key
@@ -672,15 +679,40 @@ def _friendly_api_error(e: Exception) -> str:
 
 
 class GenAIService:
-    """Thin, resilient wrapper around the Google GenAI client."""
+    """Thin, resilient wrapper around the Google GenAI client.
 
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or validate_api_key()
-        self.client = genai.Client(api_key=self.api_key)
+    The service can be constructed *without* an API key configured: in that
+    case ``api_key`` is an empty string and ``client`` stays ``None`` until a
+    key is supplied via :meth:`set_api_key` (e.g. typed into the GUI dialog).
+    Every real API call goes through :meth:`_ensure_client`, which fails with
+    a clear :class:`ApiKeyError` if no key has been entered yet.
+    """
+
+    def __init__(self, api_key: Optional[str] = None, require_key: bool = True):
+        if api_key is not None:
+            self.api_key = validate_api_key(api_key)
+        elif require_key:
+            self.api_key = validate_api_key()
+        else:
+            # Startup without a key: allowed — the GUI collects one on demand.
+            self.api_key = get_api_key()
+        self.client = genai.Client(api_key=self.api_key) if self.api_key else None
         # Cooperative cancellation: set the Event to abort in-flight work.
         self.cancel_event: threading.Event = threading.Event()
         # JSONL task journal (statistics / observability).
         self._journal = TaskJournal(Config.TASKS_JOURNAL_FILE)
+
+    @property
+    def has_api_key(self) -> bool:
+        """True when a usable key is configured (env/.env or entered at runtime)."""
+        return bool(self.api_key or get_api_key())
+
+    def _ensure_client(self):
+        """Return a live GenAI client, building one lazily if needed."""
+        if self.client is None:
+            self.api_key = validate_api_key()
+            self.client = genai.Client(api_key=self.api_key)
+        return self.client
 
     def set_api_key(self, key: str, persist: bool = True) -> str:
         """Swap the live API key at runtime (validated + optionally saved).
@@ -747,7 +779,7 @@ class GenAIService:
                 if progress_cb:
                     progress_cb(pct)
             time.sleep(Config.POLL_INTERVAL_S)
-            operation = self.client.operations.get(operation)
+            operation = self._ensure_client().operations.get(operation)
         if progress_cb:
             progress_cb(100)
 
@@ -768,7 +800,7 @@ class GenAIService:
 
     def count_tokens(self, text: str) -> int:
         try:
-            resp = self.client.models.count_tokens(model=Config.MODEL_TEXT, contents=text)
+            resp = self._ensure_client().models.count_tokens(model=Config.MODEL_TEXT, contents=text)
             return int(resp.total_tokens)
         except Exception as e:  # noqa: BLE001
             logger.debug("Token counting unavailable: %s", e)
@@ -782,7 +814,7 @@ class GenAIService:
                 f"'{video_prompt}'. Focus on avoiding bad quality, deformations, blurs, "
                 "watermark, text, ugly, distorted. Return ONLY the keywords."
             )
-            resp = self.client.models.generate_content(model=Config.MODEL_TEXT, contents=prompt)
+            resp = self._ensure_client().models.generate_content(model=Config.MODEL_TEXT, contents=prompt)
             return resp.text.strip()
         except Exception as e:  # noqa: BLE001
             logger.warning("Negative prompt generation failed: %s", e)
@@ -797,7 +829,7 @@ class GenAIService:
                 "covering subject, action, camera movement, lighting, mood and style. "
                 "Return ONLY the prompt text.\n\nIdea: " + short_prompt
             )
-            resp = self.client.models.generate_content(model=Config.MODEL_TEXT, contents=meta)
+            resp = self._ensure_client().models.generate_content(model=Config.MODEL_TEXT, contents=meta)
             return resp.text.strip()
         except Exception as e:  # noqa: BLE001
             logger.warning("Prompt expansion failed: %s", e)
@@ -913,7 +945,7 @@ class GenAIService:
 
             def submit(cfg_params: dict):
                 cfg = types.GenerateVideosConfig(**cfg_params)
-                return self.client.models.generate_videos(
+                return self._ensure_client().models.generate_videos(
                     model=Config.MODEL_VIDEO,
                     prompt=prompt,
                     image=image_param,
@@ -950,7 +982,7 @@ class GenAIService:
                     "Частые причины: политика безопасности (персоны), квота или неподдерживаемые параметры."
                 )
             generated_video = videos[0]
-            self.client.files.download(file=generated_video.video)
+            self._ensure_client().files.download(file=generated_video.video)
             generated_video.video.save(output_filename)
             logger.info("Video saved: %s", output_filename)
             self._journal.record("video", "ok", prompt=prompt, output=output_filename,
@@ -960,6 +992,12 @@ class GenAIService:
         except CancelledError:
             logger.warning("Video generation cancelled by user.")
             self._journal.record("video", "failed", prompt=prompt, error="cancelled",
+                                 duration_s=time.time() - start)
+            raise
+        except ApiKeyError:
+            # No key entered yet — re-raise so the GUI can pop the API-key
+            # dialog instead of silently logging a generic failure.
+            self._journal.record("video", "failed", prompt=prompt, error="missing api key",
                                  duration_s=time.time() - start)
             raise
         except Exception as e:  # noqa: BLE001
@@ -975,7 +1013,7 @@ class GenAIService:
         self._check_cancelled()
         start = time.time()
         try:
-            response = self.client.models.generate_content(
+            response = self._ensure_client().models.generate_content(
                 model=Config.MODEL_IMAGE,
                 contents=[prompt],
                 config={"response_modalities": ["IMAGE"]},
@@ -993,6 +1031,10 @@ class GenAIService:
             return None
         except CancelledError:
             self._journal.record("image", "failed", prompt=prompt, error="cancelled")
+            raise
+        except ApiKeyError:
+            # Let the GUI catch it and open the API-key dialog.
+            self._journal.record("image", "failed", prompt=prompt, error="missing api key")
             raise
         except Exception as e:  # noqa: BLE001
             logger.error("Image generation failed: %s", e)
@@ -1020,6 +1062,9 @@ class GenAIService:
         logger.info("Generating music: '%s' (%d sec)...", prompt, duration_seconds)
         FileManager.record_prompt(prompt, "audio", output_filename)
         self._check_cancelled()
+        # Build/validate the client *before* entering the async session so a
+        # missing key raises ApiKeyError outward (GUI opens the key dialog).
+        self._ensure_client()
         start = time.time()
 
         async def run_audio_session():
@@ -1093,6 +1138,11 @@ class GenAIService:
             return None
         except CancelledError:
             self._journal.record("audio", "failed", prompt=prompt, error="cancelled",
+                                 duration_s=time.time() - start)
+            raise
+        except ApiKeyError:
+            # Let the GUI catch it and open the API-key dialog.
+            self._journal.record("audio", "failed", prompt=prompt, error="missing api key",
                                  duration_s=time.time() - start)
             raise
         except Exception as e:  # noqa: BLE001
@@ -1188,6 +1238,9 @@ class GenerationOrchestrator:
                 output_filename = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "veo_video", ".mp4")
 
             self._report_progress(5, "submitting")
+            # Fail fast (before any quota is spent) if no key is configured;
+            # ApiKeyError propagates so the GUI can show its API-key dialog.
+            self.ai._ensure_client()
             out = self.ai.generate_video(
                 prompt,
                 output_filename,
