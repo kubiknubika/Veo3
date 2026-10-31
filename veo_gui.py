@@ -1,148 +1,236 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
-import threading
-import sys
+"""Tkinter GUI for Veo3 Pro Generator.
+
+Design notes:
+    * No ``sys.stdout`` monkey-patching. Worker threads push messages into a
+      ``queue.Queue``; the Tk main loop drains it via ``root.after`` polling —
+      thread-safe UI updates (fixes interleaved writes from concurrent batch).
+    * All high-level workflows are delegated to :class:`GenerationOrchestrator`
+      so CLI and GUI share one implementation.
+    * Shared state variables (resolution / aspect ratio) live in ``__init__``
+      and are available on every tab (fixes AttributeError in Bridge/Image/Audio).
+"""
+
+from __future__ import annotations
+
 import os
-import shutil
-from veo_generator import GenAIService, Config, FileManager, MediaProcessor
+import queue
+import subprocess
+import sys
+import threading
+import tkinter as tk
+from typing import Callable, Optional
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 
-class TextRedirector(object):
-    def __init__(self, widget, tag="stdout"):
-        self.widget = widget
-        self.tag = tag
+from veo_generator import (
+    ApiKeyError,
+    Config,
+    FileManager,
+    GenerationOrchestrator,
+    validate_api_key,
+)
 
-    def write(self, str):
-        self.widget.configure(state="normal")
-        self.widget.insert("end", str, (self.tag,))
-        self.widget.see("end")
-        self.widget.configure(state="disabled")
-    
-    def flush(self):
-        pass
 
 class VeoGUIApp:
-    def __init__(self, root):
+    def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Veo3 Pro Generator UI")
         self.root.geometry("900x700")
-        
-        self.ai = GenAIService()
+
+        # --- API key validation up front (item 3) ---
+        try:
+            validate_api_key()
+        except ApiKeyError as e:
+            messagebox.showerror("Configuration error", str(e))
+            raise SystemExit(2)
+
+        # Log-message queue drained by the Tk main loop (item 2)
+        self._log_queue: "queue.Queue[str]" = queue.Queue()
+        self._stop_polling = threading.Event()
+
+        # Orchestrator routes all core progress lines into our queue
+        self.orch = GenerationOrchestrator(log_fn=self._enqueue_log)
+        self.ai = self.orch.ai
         Config.ensure_dirs()
-        
+
+        # Shared generation options — defined once, used by ALL tabs (item 1)
+        self.res_var = tk.StringVar(value="720p")
+        self.ar_var = tk.StringVar(value="16:9")
+        self.auto_neg_var = tk.BooleanVar(value=True)
+
         # Bridge Mode State
-        self.bridge_state = {
+        self.bridge_state: dict = {
             "p1": None,
             "bridge": None,
-            "v2_type": None, # 'existing' or 'generated'
+            "v2_type": None,  # 'existing' or 'generated'
             "v2_path": None,
             "preview": None,
-            "temp_files": []
+            "temp_files": [],
+            "aspect_ratio": "16:9",
+            "resolution": "720p",
         }
 
         self._init_ui()
+        self._poll_log_queue()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _init_ui(self):
-        # Main Container
+    # ------------------------------------------------------------------ #
+    # Thread-safe logging infrastructure (item 2)
+    # ------------------------------------------------------------------ #
+
+    def _enqueue_log(self, message: str) -> None:
+        """Called from worker threads; safe because it only touches a Queue."""
+        self._log_queue.put(str(message))
+
+    def _poll_log_queue(self) -> None:
+        """Drain the log queue from the Tk main thread."""
+        if self._stop_polling.is_set():
+            return
+        try:
+            while True:
+                msg = self._log_queue.get_nowait()
+                self._append_console(msg)
+        except queue.Empty:
+            pass
+        self.root.after(100, self._poll_log_queue)
+
+    def _append_console(self, text: str) -> None:
+        self.console.configure(state="normal")
+        self.console.insert("end", text.rstrip("\n") + "\n")
+        self.console.see("end")
+        self.console.configure(state="disabled")
+
+    def _ui(self, fn: Callable[[], None]) -> None:
+        """Schedule a callable on the Tk main thread."""
+        self.root.after(0, fn)
+
+    def _on_close(self) -> None:
+        self._stop_polling.set()
+        self.root.destroy()
+
+    # ------------------------------------------------------------------ #
+    # UI construction
+    # ------------------------------------------------------------------ #
+
+    def _init_ui(self) -> None:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
         # Output Console (Bottom)
         console_frame = ttk.LabelFrame(main_frame, text="Log Output", height=200)
         console_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
-        
+
         self.console = scrolledtext.ScrolledText(console_frame, height=10, state="disabled", font=("Consolas", 9))
         self.console.pack(fill=tk.BOTH, expand=True)
-        
-        # Redirect stdout
-        sys.stdout = TextRedirector(self.console, "stdout")
-        sys.stderr = TextRedirector(self.console, "stderr")
 
         # Tabs
         self.notebook = ttk.Notebook(main_frame)
         self.notebook.pack(fill=tk.BOTH, expand=True)
 
-        # Tab 1: Single Generation
         self.tab_single = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_single, text="Single Gen")
         self._setup_single_tab()
 
-        # Tab 2: Bridge/Interpolation
         self.tab_bridge = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_bridge, text="Bridge / Interpolation")
         self._setup_bridge_tab()
-        
-        # Tab 3: Utils (Image/Audio)
+
         self.tab_utils = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_utils, text="Image & Audio")
         self._setup_utils_tab()
 
-    def _setup_single_tab(self):
+    def _options_row(self, parent: ttk.Frame, row: int) -> None:
+        """Shared resolution/aspect controls bound to app-level StringVars."""
+        ttk.Label(parent, text="Resolution:").grid(row=row, column=0, padx=5, sticky=tk.W)
+        ttk.Combobox(parent, textvariable=self.res_var, values=["720p", "1080p", "4k"],
+                     state="readonly", width=8).grid(row=row, column=1, padx=5)
+        ttk.Label(parent, text="Aspect Ratio:").grid(row=row, column=2, padx=5, sticky=tk.W)
+        ttk.Combobox(parent, textvariable=self.ar_var, values=["16:9", "9:16"],
+                     state="readonly", width=8).grid(row=row, column=3, padx=5)
+
+    def _setup_single_tab(self) -> None:
         frame = ttk.Frame(self.tab_single, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        # Prompt
         ttk.Label(frame, text="Prompt:").pack(anchor=tk.W)
         self.single_prompt = tk.Text(frame, height=5, width=60)
         self.single_prompt.pack(fill=tk.X, pady=5)
 
-        # Options Grid
         opts = ttk.Frame(frame)
         opts.pack(fill=tk.X, pady=10)
+        self._options_row(opts, 0)
 
-        ttk.Label(opts, text="Resolution:").grid(row=0, column=0, padx=5, sticky=tk.W)
-        self.res_var = tk.StringVar(value="720p")
-        ttk.Combobox(opts, textvariable=self.res_var, values=["720p", "1080p", "4k"], state="readonly").grid(row=0, column=1, padx=5)
+        ttk.Label(opts, text="Duration (s):").grid(row=1, column=0, padx=5, sticky=tk.W)
+        self.dur_var = tk.StringVar(value="")
+        ttk.Entry(opts, textvariable=self.dur_var, width=10).grid(row=1, column=1, padx=5, sticky=tk.W)
 
-        ttk.Label(opts, text="Aspect Ratio:").grid(row=0, column=2, padx=5, sticky=tk.W)
-        self.ar_var = tk.StringVar(value="16:9")
-        ttk.Combobox(opts, textvariable=self.ar_var, values=["16:9", "9:16"], state="readonly").grid(row=0, column=3, padx=5)
+        self.chk_expand = tk.BooleanVar(value=False)
+        ttk.Checkbutton(opts, text="AI-expand prompt", variable=self.chk_expand).grid(row=1, column=2, columnspan=2, padx=5, sticky=tk.W)
 
-        # Negative Prompt
         ttk.Label(frame, text="Negative Prompt (Auto if empty):").pack(anchor=tk.W)
         self.neg_prompt = tk.Entry(frame)
         self.neg_prompt.pack(fill=tk.X, pady=5)
 
-        # Buttons
+        self.auto_neg_chk = ttk.Checkbutton(frame, text="Auto-generate negative prompt (uses extra LLM quota)",
+                                            variable=self.auto_neg_var)
+        self.auto_neg_chk.pack(anchor=tk.W)
+
         btn_frame = ttk.Frame(frame)
         btn_frame.pack(fill=tk.X, pady=20)
-        
         ttk.Button(btn_frame, text="Generate Video", command=self._run_single_gen).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Open Last Result", command=lambda: self._open_last(self._last_video)).pack(side=tk.LEFT, padx=5)
 
-    def _setup_utils_tab(self):
+        self._last_video: Optional[str] = None
+
+    def _setup_utils_tab(self) -> None:
         frame = ttk.Frame(self.tab_utils, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
-        
+
         # Image Gen
         lf_img = ttk.LabelFrame(frame, text="Image Generation", padding=10)
         lf_img.pack(fill=tk.X, pady=10)
-        
+
         ttk.Label(lf_img, text="Prompt:").pack(anchor=tk.W)
         self.img_prompt = tk.Entry(lf_img)
         self.img_prompt.pack(fill=tk.X, pady=5)
-        ttk.Button(lf_img, text="Generate Image", command=self._run_image_gen).pack(anchor=tk.E)
+        img_btns = ttk.Frame(lf_img)
+        img_btns.pack(fill=tk.X)
+        ttk.Button(img_btns, text="Generate Image", command=self._run_image_gen).pack(side=tk.RIGHT)
+        ttk.Button(img_btns, text="Open Last", command=lambda: self._open_last(self._last_image)).pack(side=tk.RIGHT, padx=5)
+        self._last_image: Optional[str] = None
 
         # Audio Gen
         lf_aud = ttk.LabelFrame(frame, text="Audio Generation (Lyria)", padding=10)
         lf_aud.pack(fill=tk.X, pady=10)
-        
+
         ttk.Label(lf_aud, text="Prompt:").pack(anchor=tk.W)
         self.aud_prompt = tk.Entry(lf_aud)
         self.aud_prompt.pack(fill=tk.X, pady=5)
-        
+
         dur_frame = ttk.Frame(lf_aud)
         dur_frame.pack(fill=tk.X)
         ttk.Label(dur_frame, text="Duration (sec):").pack(side=tk.LEFT)
         self.aud_dur = tk.Entry(dur_frame, width=10)
         self.aud_dur.insert(0, "10")
         self.aud_dur.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(lf_aud, text="Generate Audio", command=self._run_audio_gen).pack(anchor=tk.E)
 
-    def _setup_bridge_tab(self):
+        aud_btns = ttk.Frame(lf_aud)
+        aud_btns.pack(fill=tk.X)
+        ttk.Button(aud_btns, text="Generate Audio", command=self._run_audio_gen).pack(side=tk.RIGHT)
+        ttk.Button(aud_btns, text="Open Last", command=lambda: self._open_last(self._last_audio)).pack(side=tk.RIGHT, padx=5)
+        self._last_audio: Optional[str] = None
+
+        # Prompt history (item 14)
+        lf_hist = ttk.LabelFrame(frame, text="Prompt History", padding=10)
+        lf_hist.pack(fill=tk.BOTH, expand=True, pady=10)
+        self.hist_list = tk.Listbox(lf_hist, height=6)
+        self.hist_list.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+        ttk.Button(lf_hist, text="Refresh", command=self._refresh_history).pack(side=tk.RIGHT, anchor=tk.N)
+        ttk.Button(lf_hist, text="Reuse → Single", command=self._reuse_history).pack(side=tk.RIGHT, anchor=tk.N, pady=5)
+
+    def _setup_bridge_tab(self) -> None:
         frame = ttk.Frame(self.tab_bridge, padding=20)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        # Video 1 Selection
         v1_frame = ttk.Frame(frame)
         v1_frame.pack(fill=tk.X, pady=5)
         ttk.Label(v1_frame, text="Video 1 (Start):").pack(side=tk.LEFT)
@@ -150,7 +238,6 @@ class VeoGUIApp:
         ttk.Entry(v1_frame, textvariable=self.v1_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
         ttk.Button(v1_frame, text="Browse", command=lambda: self._browse_file(self.v1_path_var)).pack(side=tk.LEFT)
 
-        # Video 2 Selection
         v2_frame = ttk.Frame(frame)
         v2_frame.pack(fill=tk.X, pady=5)
         ttk.Label(v2_frame, text="Video 2 (End):").pack(side=tk.LEFT)
@@ -159,262 +246,265 @@ class VeoGUIApp:
         ttk.Button(v2_frame, text="Browse (Optional)", command=lambda: self._browse_file(self.v2_path_var)).pack(side=tk.LEFT)
         ttk.Label(frame, text="* Leave Video 2 empty to generate it from prompt").pack(anchor=tk.W, padx=5)
 
-        # Bridge Prompt
-        ttk.Label(frame, text="Bridge Transition Prompt:").pack(anchor=tk.W, pady=(10,0))
+        ttk.Label(frame, text="Bridge Transition Prompt:").pack(anchor=tk.W, pady=(10, 0))
         self.bridge_prompt = tk.Entry(frame)
         self.bridge_prompt.pack(fill=tk.X, pady=5)
 
-        # Video 2 Prompt (if generated)
-        ttk.Label(frame, text="Video 2 Prompt (if generating new):").pack(anchor=tk.W, pady=(10,0))
+        ttk.Label(frame, text="Video 2 Prompt (if generating new):").pack(anchor=tk.W, pady=(10, 0))
         self.v2_gen_prompt = tk.Entry(frame)
         self.v2_gen_prompt.pack(fill=tk.X, pady=5)
 
-        # Bridge Actions
+        bopts = ttk.Frame(frame)
+        bopts.pack(fill=tk.X, pady=5)
+        self._options_row(bopts, 0)
+
         act_frame = ttk.Frame(frame)
         act_frame.pack(fill=tk.X, pady=20)
-        
         self.btn_start_bridge = ttk.Button(act_frame, text="Start Bridge Process", command=self._start_bridge_thread)
         self.btn_start_bridge.pack(side=tk.LEFT)
 
-        # Verification Controls (Hidden initially)
         self.verif_frame = ttk.LabelFrame(frame, text="Verification Loop", padding=10)
         self.verif_frame.pack(fill=tk.X, pady=20)
-        
+
         self.lbl_status = ttk.Label(self.verif_frame, text="Waiting for generation...")
         self.lbl_status.pack(fill=tk.X)
-        
+
         btn_verif = ttk.Frame(self.verif_frame)
         btn_verif.pack(fill=tk.X, pady=5)
-        
-        self.btn_accept = ttk.Button(btn_verif, text="✅ Accept & Save", command=self._bridge_accept, state="disabled")
+
+        self.btn_accept = ttk.Button(btn_verif, text="Accept & Save", command=self._bridge_accept, state="disabled")
         self.btn_accept.pack(side=tk.LEFT, padx=5)
-        
-        self.btn_regen = ttk.Button(btn_verif, text="🔄 Regenerate V2", command=self._bridge_regen, state="disabled")
+
+        self.btn_regen = ttk.Button(btn_verif, text="Regenerate V2", command=self._bridge_regen, state="disabled")
         self.btn_regen.pack(side=tk.LEFT, padx=5)
 
-    def _browse_file(self, var):
-        f = filedialog.askopenfilename(filetypes=[("Video files", "*.mp4")])
-        if f: var.set(f)
+        self.btn_preview = ttk.Button(btn_verif, text="Play Preview", command=self._bridge_play_preview, state="disabled")
+        self.btn_preview.pack(side=tk.LEFT, padx=5)
 
-    def _run_in_thread(self, target):
-        threading.Thread(target=target, daemon=True).start()
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
 
-    # --- Actions ---
+    def _browse_file(self, var: tk.StringVar) -> None:
+        f = filedialog.askopenfilename(filetypes=[("Media files", "*.mp4 *.mov *.avi *.mkv")])
+        if f:
+            var.set(f)
 
-    def _run_single_gen(self):
+    def _run_in_thread(self, target: Callable[[], None]) -> None:
+        def wrapper() -> None:
+            try:
+                target()
+            except Exception as e:  # noqa: BLE001 - never let a worker die silently
+                self._enqueue_log(f"Unexpected error in worker thread: {e}")
+        threading.Thread(target=wrapper, daemon=True).start()
+
+    def _open_last(self, path: Optional[str]) -> None:
+        """Open the most recent result with the OS default player (item 12)."""
+        if not path or not os.path.exists(path):
+            messagebox.showinfo("Preview", "No generated file available yet.")
+            return
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+        except OSError as e:
+            messagebox.showerror("Preview", f"Could not open player: {e}")
+
+    def _refresh_history(self) -> None:
+        self.hist_list.delete(0, tk.END)
+        for h in FileManager.load_history(50):
+            self.hist_list.insert(tk.END, f"[{h.get('ts', '')}] ({h.get('kind', '?')}) {str(h.get('prompt', ''))[:70]}")
+
+    def _reuse_history(self) -> None:
+        sel = self.hist_list.curselection()
+        if not sel:
+            return
+        line = self.hist_list.get(sel[0])
+        prompt = line.split(") ", 1)[-1]
+        self.single_prompt.delete("1.0", tk.END)
+        self.single_prompt.insert("1.0", prompt)
+        self.notebook.select(self.tab_single)
+
+    def _parse_duration(self) -> Optional[int]:
+        raw = self.dur_var.get().strip()
+        return int(raw) if raw.isdigit() else None
+
+    # ------------------------------------------------------------------ #
+    # Actions — all flows go through the shared orchestrator (item 8)
+    # ------------------------------------------------------------------ #
+
+    def _run_single_gen(self) -> None:
         prompt = self.single_prompt.get("1.0", tk.END).strip()
-        if not prompt: return
-        
-        def task():
-            print(f"Starting Video Generation...")
-            neg = self.neg_prompt.get().strip() or None
-            if not neg:
-                print("Auto-generating negative prompt...")
-                neg = self.ai.generate_negative_prompt(prompt)
-                print(f"Negative: {neg}")
+        if not prompt:
+            return
 
-            fname = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "ui_video", ".mp4")
-            self.ai.generate_video(
-                prompt, fname, 
-                aspect_ratio=self.ar_var.get(), 
-                resolution=self.res_var.get(),
-                negative_prompt=neg
-            )
-            print("Done!")
-        
+        neg = self.neg_prompt.get().strip() or None
+        ar = self.ar_var.get()
+        res = self.res_var.get()
+        auto_neg = self.auto_neg_var.get()
+        expand = self.chk_expand.get()
+        duration = self._parse_duration()
+
+        def task() -> None:
+            self._enqueue_log("Starting Video Generation...")
+            out = self.orch.single_video(prompt, aspect_ratio=ar, resolution=res,
+                                         negative_prompt=neg, auto_negative=auto_neg,
+                                         expand=expand, duration_seconds=duration)
+            if out:
+                self._last_video = out
+                self._enqueue_log(f"Done! Saved: {out}")
+            else:
+                self._enqueue_log("Generation failed. See log above.")
+
         self._run_in_thread(task)
 
-    def _run_image_gen(self):
+    def _run_image_gen(self) -> None:
         prompt = self.img_prompt.get().strip()
-        if not prompt: return
-        
-        # Ask for file in main thread to avoid threading issues with dialogs
+        if not prompt:
+            return
+
         fname = filedialog.asksaveasfilename(
             initialdir=Config.OUTPUT_DIRS["image"],
             initialfile="ui_image.png",
             defaultextension=".png",
-            filetypes=[("PNG Image", "*.png")]
+            filetypes=[("PNG Image", "*.png")],
         )
-        if not fname: return
+        if not fname:
+            return
 
-        def task():
-            self.ai.generate_image(prompt, fname)
+        def task() -> None:
+            out = self.ai.generate_image(prompt, fname)
+            if out:
+                self._last_image = out
+                self._enqueue_log(f"Image saved: {out}")
+
         self._run_in_thread(task)
 
-    def _run_audio_gen(self):
+    def _run_audio_gen(self) -> None:
         prompt = self.aud_prompt.get().strip()
-        try: dur = int(self.aud_dur.get())
-        except: dur = 10
-        if not prompt: return
+        if not prompt:
+            return
+        try:
+            dur = int(self.aud_dur.get())
+        except ValueError:
+            dur = 10
 
         fname = filedialog.asksaveasfilename(
             initialdir=Config.OUTPUT_DIRS["audio"],
             initialfile="ui_audio.wav",
             defaultextension=".wav",
-            filetypes=[("WAV Audio", "*.wav")]
+            filetypes=[("WAV Audio", "*.wav")],
         )
-        if not fname: return
+        if not fname:
+            return
 
-        def task():
-            self.ai.generate_audio(prompt, dur, fname)
+        def task() -> None:
+            out = self.ai.generate_audio(prompt, dur, fname)
+            if out:
+                self._last_audio = out
+                self._enqueue_log(f"Audio saved: {out}")
+
         self._run_in_thread(task)
 
-    # --- Bridge Logic ---
+    # ------------------------------------------------------------------ #
+    # Bridge Logic (delegated to orchestrator)
+    # ------------------------------------------------------------------ #
 
-    def _start_bridge_thread(self):
+    def _start_bridge_thread(self) -> None:
         self.btn_start_bridge.configure(state="disabled")
         self.btn_accept.configure(state="disabled")
         self.btn_regen.configure(state="disabled")
+        self.btn_preview.configure(state="disabled")
         self._run_in_thread(self._process_bridge_initial)
 
-    def _process_bridge_initial(self):
-        # 1. Validate V1
+    def _process_bridge_initial(self) -> None:
         v1 = self.v1_path_var.get().strip()
-        if not os.path.exists(v1):
-            print("Error: Video 1 not found")
-            self.root.after(0, lambda: self.btn_start_bridge.configure(state="normal"))
+        v2_existing = self.v2_path_var.get().strip() or None
+        v2_prompt = self.v2_gen_prompt.get().strip() or None
+        bridge_prompt = self.bridge_prompt.get().strip() or None
+
+        state = self.orch.bridge_step1_prepare(
+            v1, v2_existing, v2_prompt, bridge_prompt,
+            aspect_ratio=self.ar_var.get(), resolution=self.res_var.get(),
+        )
+        if not state:
+            self._ui(lambda: self.btn_start_bridge.configure(state="normal"))
             return
-        
-        self.bridge_state["p1"] = v1
-        self.bridge_state["temp_files"] = []
 
-        # 2. Determine V2
-        v2_input = self.v2_path_var.get().strip()
-        if v2_input and os.path.exists(v2_input):
-            self.bridge_state["v2_type"] = "existing"
-            self.bridge_state["v2_path"] = v2_input
+        self.bridge_state = state
+        preview = self.orch.bridge_stitch_preview(state)
+        if preview:
+            self._ui(self._enable_verif_ui)
         else:
-            self.bridge_state["v2_type"] = "generated"
-            prompt_v2 = self.v2_gen_prompt.get().strip()
-            if not prompt_v2:
-                print("Error: Provide Video 2 path OR Prompt")
-                self.root.after(0, lambda: self.btn_start_bridge.configure(state="normal"))
-                return
-            
-            print("Generating Initial Video 2...")
-            v2_path = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "ui_bridge_v2", ".mp4")
-            if self.ai.generate_video(prompt_v2, v2_path, resolution=self.res_var.get()): # Use simple params for V2 initial
-                self.bridge_state["v2_path"] = v2_path
-                self.bridge_state["temp_files"].append(v2_path)
-            else:
-                self.root.after(0, lambda: self.btn_start_bridge.configure(state="normal"))
-                return
+            self._ui(lambda: self.btn_start_bridge.configure(state="normal"))
 
-        # 3. Generate Bridge
-        print("Extracting frames...")
-        f1 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "ui_br_start", ".png")
-        f2 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "ui_br_end", ".png")
-        self.bridge_state["temp_files"].extend([f1, f2])
-
-        if MediaProcessor.extract_frame(self.bridge_state["p1"], f1, "last") and \
-           MediaProcessor.extract_frame(self.bridge_state["v2_path"], f2, "first"):
-            
-            print("Generating Bridge Video...")
-            b_prompt = self.bridge_prompt.get().strip() or "Smooth transition"
-            b_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "ui_bridge_seg", ".mp4")
-            
-            if self.ai.generate_video(b_prompt, b_name, image_path=f1, last_frame_path=f2, resolution=self.res_var.get()):
-                self.bridge_state["bridge"] = b_name
-                self.bridge_state["temp_files"].append(b_name)
-                
-                # Stitch Preview
-                self._stitch_preview()
-            else:
-                print("Bridge generation failed.")
-                self.root.after(0, lambda: self.btn_start_bridge.configure(state="normal"))
-        else:
-            print("Frame extraction failed.")
-            self.root.after(0, lambda: self.btn_start_bridge.configure(state="normal"))
-
-    def _stitch_preview(self):
-        print("Stitching preview...")
-        prev_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "ui_preview_stitch", ".mp4")
-        files = [self.bridge_state["p1"], self.bridge_state["bridge"], self.bridge_state["v2_path"]]
-        
-        if MediaProcessor.concatenate_videos(files, prev_name):
-            self.bridge_state["preview"] = prev_name
-            print(f"Preview Ready: {prev_name}")
-            
-            # Update UI
-            self.root.after(0, self._enable_verif_ui)
-        else:
-            print("Stitching failed.")
-
-    def _enable_verif_ui(self):
-        self.lbl_status.configure(text=f"Preview created. Check: {os.path.basename(self.bridge_state['preview'])}")
+    def _enable_verif_ui(self) -> None:
+        self.lbl_status.configure(text=f"Preview created: {os.path.basename(self.bridge_state['preview'] or '')}")
         self.btn_accept.configure(state="normal")
-        
-        # Only allow regen if V2 is generated type (or user wants to replace existing?)
-        # Logic matches CLI: only if we are generating V2 can we regen it easily based on bridge end.
-        # Actually CLI deletes current V2.
-        self.btn_regen.configure(state="normal") 
+        self.btn_regen.configure(state="normal")
+        self.btn_preview.configure(state="normal")
 
-    def _bridge_accept(self):
-        # Save
-        dest = filedialog.asksaveasfilename(defaultextension=".mp4", initialdir=Config.OUTPUT_DIRS["video"], initialfile="final_bridge.mp4")
-        if dest:
-            try:
-                shutil.copy(self.bridge_state["preview"], dest)
-                print(f"Saved to {dest}")
-                
-                # Cleanup
-                if self.bridge_state["preview"]: os.remove(self.bridge_state["preview"])
-                FileManager.cleanup_files(self.bridge_state["temp_files"])
-                
-                # If V2 was generated, we delete the temp file because it's baked into final
-                # But wait, maybe user wants it? Config says "delete generated V2" in CLI.
-                # Let's clean it up to be safe.
-                
-                self.btn_start_bridge.configure(state="normal")
-                self.btn_accept.configure(state="disabled")
-                self.btn_regen.configure(state="disabled")
-                self.lbl_status.configure(text="Saved.")
-            except Exception as e:
-                print(f"Error saving: {e}")
+    def _bridge_play_preview(self) -> None:
+        self._open_last(self.bridge_state.get("preview"))
 
-    def _bridge_regen(self):
-        prompt = self.v2_gen_prompt.get().strip()
-        if not prompt:
-            print("Please enter a Video 2 prompt for regeneration.")
+    def _bridge_accept(self) -> None:
+        dest = filedialog.asksaveasfilename(defaultextension=".mp4",
+                                            initialdir=Config.OUTPUT_DIRS["video"],
+                                            initialfile="final_bridge.mp4")
+        if not dest:
             return
-        
+
+        def task() -> None:
+            out = self.orch.bridge_accept(self.bridge_state, dest)
+            if out:
+                self._enqueue_log(f"Saved to {out}")
+                self._ui(self._reset_bridge_ui)
+
+        self._run_in_thread(task)
+
+    def _reset_bridge_ui(self) -> None:
+        self.btn_start_bridge.configure(state="normal")
         self.btn_accept.configure(state="disabled")
         self.btn_regen.configure(state="disabled")
+        self.btn_preview.configure(state="disabled")
+        self.lbl_status.configure(text="Saved.")
+
+    def _bridge_regen(self) -> None:
+        prompt = self.v2_gen_prompt.get().strip()
+        if not prompt:
+            messagebox.showinfo("Regenerate", "Please enter a Video 2 prompt for regeneration.")
+            return
+
+        self.btn_accept.configure(state="disabled")
+        self.btn_regen.configure(state="disabled")
+        self.btn_preview.configure(state="disabled")
         self.lbl_status.configure(text="Regenerating V2 from bridge end...")
-        
+
         self._run_in_thread(lambda: self._process_regen(prompt))
 
-    def _process_regen(self, prompt):
-        # 1. Cleanup old preview and old V2 (if generated)
-        if self.bridge_state["preview"] and os.path.exists(self.bridge_state["preview"]):
-            os.remove(self.bridge_state["preview"])
-        
-        if self.bridge_state["v2_type"] == "generated" and self.bridge_state["v2_path"] and os.path.exists(self.bridge_state["v2_path"]):
-            try: os.remove(self.bridge_state["v2_path"])
-            except: pass
-            
-        # 2. Extract last frame of Bridge
-        bridge_end_frame = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "ui_br_last", ".png")
-        self.bridge_state["temp_files"].append(bridge_end_frame)
-        
-        if MediaProcessor.extract_frame(self.bridge_state["bridge"], bridge_end_frame, "last"):
-            # 3. Generate New V2
-            new_v2 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "ui_v2_regen", ".mp4")
-            print("Generating New V2...")
-            if self.ai.generate_video(prompt, new_v2, image_path=bridge_end_frame, resolution=self.res_var.get()):
-                self.bridge_state["v2_path"] = new_v2
-                self.bridge_state["v2_type"] = "generated"
-                self.bridge_state["temp_files"].append(new_v2)
-                
-                # 4. Stitch again
-                self._stitch_preview()
-            else:
-                print("Regeneration failed.")
-                self.root.after(0, self._enable_verif_ui) # Re-enable to try again
-        else:
-            print("Bridge frame extraction failed.")
+    def _process_regen(self, prompt: str) -> None:
+        new_v2 = self.orch.bridge_regen_v2(self.bridge_state, prompt)
+        if new_v2:
+            preview = self.orch.bridge_stitch_preview(self.bridge_state)
+            if preview:
+                self._ui(self._enable_verif_ui)
+                return
+        self._enqueue_log("Regeneration failed; previous state kept.")
+        self._ui(self._enable_verif_ui)
+
+
+def main() -> None:
+    root = tk.Tk()
+    try:
+        VeoGUIApp(root)
+    except SystemExit:
+        root.destroy()
+        raise
+    root.mainloop()
+
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = VeoGUIApp(root)
-    root.mainloop()
+    main()

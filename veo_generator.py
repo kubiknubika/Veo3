@@ -1,202 +1,457 @@
-import os
-import sys
-import time
-import cv2
+"""Veo3 Pro Generator — core application module.
+
+Provides the shared orchestration layer used by both the CLI
+(``python -m veo_generator``) and the Tkinter GUI (``veo_gui.py``).
+
+Features:
+    * Text/Image-to-Video generation via Veo 3.1 (with polling, retries, backoff)
+    * Text-to-Image generation (Imagen / NanoBanana)
+    * Music generation via Lyria realtime
+    * Video chaining, batch (concurrent) processing and Bridge interpolation
+    * Prompt-engineering helpers (LLM expansion, templates, history)
+    * Resume state for long chains, centralized logging, type hints
+"""
+
+from __future__ import annotations
+
+import argparse
 import asyncio
-import wave
+import concurrent.futures
+import json
+import logging
+import os
+import random
 import shutil
+import subprocess
+import sys
+import threading
+import time
+import wave
+from dataclasses import dataclass
+from typing import Callable, Iterable, Optional
+
+import cv2
 from google import genai
 from google.genai import types
-from PIL import Image
 from dotenv import load_dotenv
 from moviepy import VideoFileClip, concatenate_videoclips
 
-# Load environment variables
+# Load environment variables from .env (config lives outside the code)
 load_dotenv()
 
+logger = logging.getLogger("veo")
+
 # --- Configuration Constants ---
-class Config:
-    MODEL_VIDEO = "veo-3.1-generate-preview"
-    MODEL_IMAGE = "gemini-2.5-flash-image"
-    MODEL_TEXT = "gemini-3.0-flash-preview"
-    MODEL_AUDIO = "models/lyria-realtime-exp"
-    TOKEN_LIMIT = 1000
-    
-    if getattr(sys, 'frozen', False):
-        # Running as compiled exe: use directory of the executable
-        BASE_DIR = os.path.dirname(sys.executable)
+
+
+@dataclass
+class AppConfig:
+    """Runtime configuration, overridable via environment / .env file."""
+
+    MODEL_VIDEO: str = os.getenv("VEO_MODEL_VIDEO", "veo-3.1-generate-preview")
+    MODEL_IMAGE: str = os.getenv("VEO_MODEL_IMAGE", "gemini-2.5-flash-image")
+    MODEL_TEXT: str = os.getenv("VEO_MODEL_TEXT", "gemini-3.0-flash-preview")
+    MODEL_AUDIO: str = os.getenv("VEO_MODEL_AUDIO", "models/lyria-realtime-exp")
+    TOKEN_LIMIT: int = int(os.getenv("VEO_TOKEN_LIMIT", "1000"))
+
+    # Polling / retry tuning
+    POLL_INTERVAL_S: float = float(os.getenv("VEO_POLL_INTERVAL", "5"))
+    POLL_TIMEOUT_S: float = float(os.getenv("VEO_POLL_TIMEOUT", "900"))
+    MAX_RETRIES: int = int(os.getenv("VEO_MAX_RETRIES", "3"))
+    BACKOFF_BASE_S: float = float(os.getenv("VEO_BACKOFF_BASE", "2"))
+
+    # Batch concurrency
+    BATCH_WORKERS: int = int(os.getenv("VEO_BATCH_WORKERS", "3"))
+
+    # Generation defaults
+    DEFAULT_DURATION_S: int = int(os.getenv("VEO_DURATION", "8"))
+    GENERATE_NEGATIVE_PROMPT: bool = os.getenv("VEO_AUTO_NEGATIVE", "true").lower() in ("1", "true", "yes")
+
+    AUDIO_SAMPLE_RATE: int = int(os.getenv("VEO_AUDIO_SAMPLE_RATE", "48000"))
+    AUDIO_CHANNELS: int = int(os.getenv("VEO_AUDIO_CHANNELS", "2"))
+    AUDIO_SAMPLE_WIDTH: int = int(os.getenv("VEO_AUDIO_SAMPLE_WIDTH", "2"))
+
+    if getattr(sys, "frozen", False):
+        BASE_DIR: str = os.path.dirname(sys.executable)
     else:
-        # Running as script: use directory of the script
         BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-    OUTPUT_DIRS = {
-        "video": os.path.join(BASE_DIR, "output", "videos"),
-        "image": os.path.join(BASE_DIR, "output", "images"),
-        "audio": os.path.join(BASE_DIR, "output", "audio"),
-    }
-    
-    @classmethod
-    def ensure_dirs(cls):
-        for path in cls.OUTPUT_DIRS.values():
+    PROMPT_TEMPLATES_FILE: str = os.path.join(BASE_DIR, "prompt_templates.json")
+    HISTORY_FILE: str = os.path.join(BASE_DIR, "output", "prompt_history.json")
+    RESUME_FILE: str = os.path.join(BASE_DIR, "output", "resume_state.json")
+
+    @property
+    def OUTPUT_DIRS(self) -> dict[str, str]:
+        return {
+            "video": os.path.join(self.BASE_DIR, "output", "videos"),
+            "image": os.path.join(self.BASE_DIR, "output", "images"),
+            "audio": os.path.join(self.BASE_DIR, "output", "audio"),
+        }
+
+    def ensure_dirs(self) -> None:
+        for path in self.OUTPUT_DIRS.values():
             os.makedirs(path, exist_ok=True)
 
+
+Config = AppConfig()
+
+_DEFAULT_TEMPLATES: dict[str, str] = {
+    "cinematic": "{prompt}, cinematic lighting, shallow depth of field, film grain, 24fps",
+    "documentary": "{prompt}, natural lighting, handheld camera, realistic colors",
+    "anime": "{prompt}, anime style, vibrant colors, dynamic motion, studio quality",
+    "product_ad": "{prompt}, clean studio background, soft reflections, commercial photography style",
+}
+
+
+class ApiKeyError(RuntimeError):
+    """Raised when the GEMINI_API_KEY is missing or obviously invalid."""
+
+
+def validate_api_key() -> str:
+    """Return the API key or raise :class:`ApiKeyError` early at startup."""
+    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if not key:
+        raise ApiKeyError(
+            "GEMINI_API_KEY is not set. Create a .env file with GEMINI_API_KEY=your_key"
+        )
+    return key
+
+
 # --- File Utilities ---
+
+
 class FileManager:
+    """Filename allocation, prompt history and resume-state persistence."""
+
+    _history_lock = threading.Lock()
+
     @staticmethod
-    def get_unique_filename(folder, base_name, extension, strict=False):
-        """
-        Generates a unique filename in the given folder.
-        If 'strict' is True, prompts the user to enter a new name if collision occurs.
-        Otherwise, appends an incrementing counter (e.g., video_1.mp4).
+    def get_unique_filename(folder: str, base_name: str, extension: str, strict: bool = False) -> str:
+        """Generate a unique filename in ``folder``.
+
+        With ``strict=True`` prompts on stdin for a new name on collision,
+        otherwise appends an incrementing counter (``video_1.mp4``).
         """
         if not base_name:
             base_name = "generated"
-        
-        # Clean extension
+
         if not extension.startswith("."):
             extension = "." + extension
 
-        # Remove extension from base_name if user typed it
         if base_name.lower().endswith(extension):
-            base_name = base_name[:-len(extension)]
+            base_name = base_name[: -len(extension)]
 
         full_path = os.path.join(folder, base_name + extension)
 
         if strict:
             while os.path.exists(full_path):
-                print(f"Ошибка: Файл '{base_name}{extension}' уже существует в {folder}.")
-                base_name = input("Введите новое имя (без расширения): ").strip()
+                logger.error("File '%s%s' already exists in %s.", base_name, extension, folder)
+                base_name = input("Enter a new name (without extension): ").strip()
                 full_path = os.path.join(folder, base_name + extension)
             return full_path
-        
-        # Auto-increment logic
+
         counter = 1
         new_base_name = base_name
         while os.path.exists(full_path):
             new_base_name = f"{base_name}_{counter}"
             full_path = os.path.join(folder, new_base_name + extension)
             counter += 1
-        
+
         return full_path
 
     @staticmethod
-    def ask_for_filename(prompt_text, default_name, folder, extension):
+    def ask_for_filename(prompt_text: str, default_name: str, folder: str, extension: str) -> str:
         name = input(prompt_text)
         if not name.strip():
             name = default_name
         return FileManager.get_unique_filename(folder, name, extension, strict=True)
 
     @staticmethod
-    def cleanup_files(file_list):
-        print("Очистка временных файлов...")
+    def cleanup_files(file_list: Iterable[Optional[str]]) -> None:
+        logger.info("Cleaning up temporary files...")
         for f in file_list:
             if f and os.path.exists(f):
                 try:
                     os.remove(f)
-                except Exception as e:
-                    print(f"Не удалось удалить {f}: {e}")
+                except OSError as e:
+                    logger.warning("Could not remove %s: %s", f, e)
+
+    # ---- Prompt history (item 14) ----
+
+    @staticmethod
+    def record_prompt(prompt: str, kind: str = "video", output: Optional[str] = None) -> None:
+        """Append a prompt to the persistent history file (thread-safe)."""
+        entry = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "kind": kind, "prompt": prompt, "output": output}
+        try:
+            with FileManager._history_lock:
+                os.makedirs(os.path.dirname(Config.HISTORY_FILE), exist_ok=True)
+                history = FileManager.load_history(limit=0)
+                history.append(entry)
+                with open(Config.HISTORY_FILE, "w", encoding="utf-8") as fh:
+                    json.dump(history[-200:], fh, ensure_ascii=False, indent=1)
+        except OSError as e:
+            logger.warning("Failed to write prompt history: %s", e)
+
+    @staticmethod
+    def load_history(limit: int = 10) -> list[dict]:
+        try:
+            with open(Config.HISTORY_FILE, "r", encoding="utf-8") as fh:
+                history = json.load(fh)
+            return history[-limit:] if limit else history
+        except (OSError, json.JSONDecodeError):
+            return []
+
+    @staticmethod
+    def load_templates() -> dict[str, str]:
+        """Load user templates from JSON, falling back to built-ins."""
+        try:
+            with open(Config.PROMPT_TEMPLATES_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and data:
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+        return dict(_DEFAULT_TEMPLATES)
+
+    @staticmethod
+    def apply_template(template_name: str, prompt: str) -> str:
+        templates = FileManager.load_templates()
+        tpl = templates.get(template_name)
+        return tpl.format(prompt=prompt) if tpl else prompt
+
+    # ---- Resume state (item 15) ----
+
+    @staticmethod
+    def save_resume_state(state: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(Config.RESUME_FILE), exist_ok=True)
+            with open(Config.RESUME_FILE, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, ensure_ascii=False, indent=1)
+        except OSError as e:
+            logger.warning("Failed to save resume state: %s", e)
+
+    @staticmethod
+    def load_resume_state() -> Optional[dict]:
+        try:
+            with open(Config.RESUME_FILE, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def clear_resume_state() -> None:
+        try:
+            if os.path.exists(Config.RESUME_FILE):
+                os.remove(Config.RESUME_FILE)
+        except OSError as e:
+            logger.warning("Failed to clear resume state: %s", e)
+
 
 # --- Media Processing (OpenCV / MoviePy) ---
+
+
 class MediaProcessor:
-    @staticmethod
-    def extract_frame(video_path, output_image_path, pos="last"):
-        """Extracts first or last frame from video."""
-        print(f"Извлечение {pos} кадра из {video_path}...")
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"Ошибка: Не удалось открыть видео {video_path}")
-            return None
-        
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        if pos == "last":
-            cap.set(cv2.CAP_PROP_POS_FRAMES, total_frames - 1)
-        else: # first
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        
-        ret, frame = cap.read()
-        if ret:
-            cv2.imwrite(output_image_path, frame)
-            cap.release()
-            return output_image_path
-        else:
-            print("Ошибка при чтении кадра.")
-            cap.release()
-            return None
+    """Frame extraction and video concatenation helpers."""
 
     @staticmethod
-    def concatenate_videos(video_paths, output_filename):
-        """Concatenates video files."""
-        print(f"Склейка {len(video_paths)} видео...")
+    def extract_frame(video_path: str, output_image_path: str, pos: str = "last") -> Optional[str]:
+        """Extract the first or last frame of a video.
+
+        For ``pos='last'`` this iterates to the true end of the file instead
+        of seeking by ``CAP_PROP_FRAME_COUNT``, which can fail on VBR/B-frame
+        streams where the reported frame count is inaccurate.
+        """
+        logger.info("Extracting %s frame from %s...", pos, video_path)
+        cap = cv2.VideoCapture(video_path)
+        try:
+            if not cap.isOpened():
+                logger.error("Could not open video %s", video_path)
+                return None
+
+            frame = None
+            if pos == "last":
+                # Robust: iterate through the stream and keep the final frame.
+                while True:
+                    ret, candidate = cap.read()
+                    if not ret:
+                        break
+                    if candidate is not None:
+                        frame = candidate
+            else:  # first
+                ret, frame = cap.read()
+                if not ret:
+                    frame = None
+
+            if frame is not None:
+                if cv2.imwrite(output_image_path, frame):
+                    return output_image_path
+                logger.error("Failed to write frame image to %s", output_image_path)
+                return None
+            logger.error("Failed to read frame from %s", video_path)
+            return None
+        finally:
+            cap.release()
+
+    @staticmethod
+    def concatenate_videos(video_paths: list[str], output_filename: str) -> Optional[str]:
+        """Concatenate video files, always releasing clip handles on error."""
+        logger.info("Concatenating %d videos...", len(video_paths))
+        clips: list[VideoFileClip] = []
+        final_clip: Optional[VideoFileClip] = None
         try:
             clips = [VideoFileClip(path) for path in video_paths]
             final_clip = concatenate_videoclips(clips)
             final_clip.write_videofile(output_filename, codec="libx264", audio_codec="aac")
-            
-            # Close clips to release file handles
-            for clip in clips:
-                clip.close()
-                
-            print(f"Объединенное видео сохранено: {output_filename}")
+            logger.info("Combined video saved: %s", output_filename)
             return output_filename
-        except Exception as e:
-            print(f"Ошибка при склейке видео: {e}")
+        except Exception as e:  # noqa: BLE001 - report and degrade gracefully
+            logger.error("Video concatenation failed: %s", e)
             return None
+        finally:
+            if final_clip is not None:
+                try:
+                    final_clip.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            for clip in clips:
+                try:
+                    clip.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
 
 # --- Generative AI Service ---
-class GenAIService:
-    def __init__(self):
-        self.client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-    def _get_image_param(self, image_path):
-        """Reads image file and returns types.Image object."""
+
+class GenAIService:
+    """Thin, resilient wrapper around the Google GenAI client."""
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or validate_api_key()
+        self.client = genai.Client(api_key=self.api_key)
+
+    # ---- low-level helpers ----
+
+    @staticmethod
+    def _is_retryable(err: Exception) -> bool:
+        err_str = str(err).lower()
+        return any(tok in err_str for tok in ("429", "rate limit", "resource exhausted", "500", "502", "503", "deadline", "unavailable", "timeout"))
+
+    def _retry(self, fn: Callable[[], object], description: str) -> object:
+        """Run ``fn`` with exponential backoff + jitter on transient errors."""
+        attempt = 0
+        while True:
+            try:
+                return fn()
+            except Exception as e:  # noqa: BLE001
+                attempt += 1
+                if attempt >= Config.MAX_RETRIES or not self._is_retryable(e):
+                    raise
+                delay = min(60.0, Config.BACKOFF_BASE_S * (2 ** (attempt - 1))) + random.uniform(0, 1)
+                logger.warning("%s failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                               description, attempt, Config.MAX_RETRIES, e, delay)
+                time.sleep(delay)
+
+    def _await_operation(self, operation) -> None:
+        """Poll an LRO with timeout; raise on timeout or transport errors."""
+        start = time.time()
+        while not getattr(operation, "done", False):
+            if time.time() - start > Config.POLL_TIMEOUT_S:
+                raise TimeoutError(f"Generation exceeded {Config.POLL_TIMEOUT_S:.0f}s timeout.")
+            time.sleep(Config.POLL_INTERVAL_S)
+            operation = self.client.operations.get(operation)
+
+    def _get_image_param(self, image_path: str) -> Optional[types.Image]:
+        """Read an image file and return a ``types.Image`` object."""
         try:
             with open(image_path, "rb") as f:
                 image_bytes = f.read()
             mime_type = "image/png"
             if image_path.lower().endswith((".jpg", ".jpeg")):
                 mime_type = "image/jpeg"
-            return types.Image(imageBytes=image_bytes, mimeType=mime_type)
-        except Exception as e:
-            print(f"Ошибка чтения изображения {image_path}: {e}")
+            return types.Image.model_construct(imageBytes=image_bytes, mimeType=mime_type)
+        except OSError as e:
+            logger.error("Failed to read image %s: %s", image_path, e)
             return None
 
-    def count_tokens(self, text):
+    # ---- text helpers ----
+
+    def count_tokens(self, text: str) -> int:
         try:
             resp = self.client.models.count_tokens(model=Config.MODEL_TEXT, contents=text)
-            return resp.total_tokens
-        except:
+            return int(resp.total_tokens)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Token counting unavailable: %s", e)
             return 0
 
-    def generate_negative_prompt(self, video_prompt):
+    def generate_negative_prompt(self, video_prompt: str) -> Optional[str]:
         try:
-            prompt = f"Generate a concise comma-separated list of negative prompt keywords for a high quality video generation based on this positive prompt: '{video_prompt}'. Focus on avoiding bad quality, deformations, blurs, watermark, text, ugly, distorted. Return ONLY the keywords."
+            prompt = (
+                "Generate a concise comma-separated list of negative prompt keywords "
+                "for a high quality video generation based on this positive prompt: "
+                f"'{video_prompt}'. Focus on avoiding bad quality, deformations, blurs, "
+                "watermark, text, ugly, distorted. Return ONLY the keywords."
+            )
             resp = self.client.models.generate_content(model=Config.MODEL_TEXT, contents=prompt)
             return resp.text.strip()
-        except:
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Negative prompt generation failed: %s", e)
             return None
 
-    def generate_video(self, prompt, output_filename, image_path=None, last_frame_path=None, aspect_ratio="16:9", resolution="720p", negative_prompt=None, reference_image_paths=None):
-        print(f"Генерация видео: '{prompt}' [{resolution}, {aspect_ratio}]")
-        
-        # Token Check
+    def expand_prompt(self, short_prompt: str) -> Optional[str]:
+        """Prompt-engineering helper: expand a terse idea into a rich Veo prompt."""
+        try:
+            meta = (
+                "You are an expert prompt engineer for Google Veo video generation. "
+                "Rewrite the following idea into one detailed English prompt (max 120 words) "
+                "covering subject, action, camera movement, lighting, mood and style. "
+                "Return ONLY the prompt text.\n\nIdea: " + short_prompt
+            )
+            resp = self.client.models.generate_content(model=Config.MODEL_TEXT, contents=meta)
+            return resp.text.strip()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Prompt expansion failed: %s", e)
+            return None
+
+    # ---- generation ----
+
+    def generate_video(
+        self,
+        prompt: str,
+        output_filename: str,
+        image_path: Optional[str] = None,
+        last_frame_path: Optional[str] = None,
+        aspect_ratio: str = "16:9",
+        resolution: str = "720p",
+        duration_seconds: Optional[int] = None,
+        generate_audio: bool = True,
+        negative_prompt: Optional[str] = None,
+        reference_image_paths: Optional[list[str]] = None,
+    ) -> Optional[str]:
+        """Generate a single Veo clip. Returns the output path or ``None``."""
+        logger.info("Generating video: '%s' [%s, %s]", prompt, resolution, aspect_ratio)
+        FileManager.record_prompt(prompt, "video", output_filename)
+
         tokens = self.count_tokens(prompt)
         if tokens > Config.TOKEN_LIMIT:
-             print(f"Внимание: Промпт слишком длинный ({tokens} токенов). Лимит: {Config.TOKEN_LIMIT}.")
-             # We proceed anyway but warn user, or could return None
-        
+            logger.warning("Prompt is very long (%d tokens). Limit: %d.", tokens, Config.TOKEN_LIMIT)
+
         try:
-            config_params = {
+            config_params: dict = {
                 "aspect_ratio": aspect_ratio,
                 "resolution": resolution,
-                "person_generation": "ALLOW_ADULT", # Default allowed
+                "person_generation": "ALLOW_ADULT",
+                "generate_audio": generate_audio,
             }
-            
+            if duration_seconds:
+                config_params["duration_seconds"] = duration_seconds
+
             if negative_prompt:
                 config_params["negative_prompt"] = negative_prompt
-            
+
             if reference_image_paths:
                 refs = []
-                for p in reference_image_paths[:3]: # Limit to 3
+                for p in reference_image_paths[:3]:
                     img_obj = self._get_image_param(p)
                     if img_obj:
                         refs.append(types.VideoGenerationReferenceImage(image=img_obj, reference_type="ASSET"))
@@ -206,431 +461,816 @@ class GenAIService:
             image_param = None
             if image_path:
                 image_param = self._get_image_param(image_path)
-                if not image_param: return None
+                if not image_param:
+                    return None
 
             if last_frame_path:
                 last_frame_param = self._get_image_param(last_frame_path)
                 if last_frame_param:
                     config_params["last_frame"] = last_frame_param
 
-            config = types.GenerateVideosConfig(**config_params)
-
-            # Try to generate with person_generation first
-            try:
-                operation = self.client.models.generate_videos(
+            def submit(cfg_params: dict):
+                cfg = types.GenerateVideosConfig(**cfg_params)
+                return self.client.models.generate_videos(
                     model=Config.MODEL_VIDEO,
                     prompt=prompt,
                     image=image_param,
-                    config=config
+                    config=cfg,
                 )
-            except Exception as e:
+
+            # Try with person_generation first; fall back without it if rejected.
+            try:
+                operation = self._retry(lambda: submit(config_params), "Video request")
+            except Exception as e:  # noqa: BLE001
                 err_str = str(e)
                 if "INVALID_ARGUMENT" in err_str and ("personGeneration" in err_str or "allow_adult" in err_str):
-                    print("Ошибка аргумента person_generation. Повторяем запрос без него...")
-                    # Remove person_generation and retry
-                    if "person_generation" in config_params:
-                        del config_params["person_generation"]
-                    
-                    config = types.GenerateVideosConfig(**config_params)
-                    operation = self.client.models.generate_videos(
-                        model=Config.MODEL_VIDEO,
-                        prompt=prompt,
-                        image=image_param,
-                        config=config
-                    )
+                    logger.warning("person_generation argument rejected; retrying without it...")
+                    config_params.pop("person_generation", None)
+                    operation = self._retry(lambda: submit(config_params), "Video request (fallback)")
                 else:
-                    raise e
+                    raise
 
-            print("Ожидание генерации...")
-            while not operation.done:
-                time.sleep(5)
-                operation = self.client.operations.get(operation)
+            logger.info("Waiting for generation to finish...")
+            self._await_operation(operation)
 
             generated_video = operation.response.generated_videos[0]
             self.client.files.download(file=generated_video.video)
             generated_video.video.save(output_filename)
-            print(f"Видео сохранено: {output_filename}")
+            logger.info("Video saved: %s", output_filename)
             return output_filename
-        except Exception as e:
-            print(f"Ошибка генерации видео: {e}")
+        except Exception as e:  # noqa: BLE001
+            logger.error("Video generation failed: %s", e)
             return None
 
-    def generate_image(self, prompt, output_filename):
-        print(f"Генерация изображения: '{prompt}'")
+    def generate_image(self, prompt: str, output_filename: str) -> Optional[str]:
+        logger.info("Generating image: '%s'", prompt)
+        FileManager.record_prompt(prompt, "image", output_filename)
         try:
             response = self.client.models.generate_content(
                 model=Config.MODEL_IMAGE,
                 contents=[prompt],
-                config={"response_modalities":['IMAGE']}
+                config={"response_modalities": ["IMAGE"]},
             )
             for part in response.parts:
                 if part.inline_data is not None:
                     image = part.as_image()
                     image.save(output_filename)
-                    print(f"Изображение сохранено: {output_filename}")
+                    logger.info("Image saved: %s", output_filename)
                     return output_filename
-        except Exception as e:
-            print(f"Ошибка генерации изображения: {e}")
+            logger.error("No image returned in response parts.")
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.error("Image generation failed: %s", e)
             return None
 
-    def generate_audio(self, prompt, duration_seconds=10, output_filename=None):
+    def generate_audio(self, prompt: str, duration_seconds: int = 10, output_filename: Optional[str] = None) -> Optional[str]:
         if not output_filename:
             output_filename = FileManager.get_unique_filename(Config.OUTPUT_DIRS["audio"], "generated_music", ".wav")
-            
-        print(f"Генерация музыки: '{prompt}' ({duration_seconds} сек)...")
-        
+
+        logger.info("Generating music: '%s' (%d sec)...", prompt, duration_seconds)
+        FileManager.record_prompt(prompt, "audio", output_filename)
+
         async def run_audio_session():
             client_lyria = genai.Client(
-                api_key=os.environ.get("GEMINI_API_KEY"),
-                http_options={'api_version': 'v1alpha'}
+                api_key=self.api_key,
+                http_options={"api_version": "v1alpha"},
             )
             audio_buffer = bytearray()
+            channels, sample_width, framerate = (
+                Config.AUDIO_CHANNELS,
+                Config.AUDIO_SAMPLE_WIDTH,
+                Config.AUDIO_SAMPLE_RATE,
+            )
             try:
                 async with client_lyria.aio.live.music.connect(model=Config.MODEL_AUDIO) as session:
                     await session.set_weighted_prompts(prompts=[types.WeightedPrompt(text=prompt, weight=1.0)])
-                    await session.set_music_generation_config(config=types.LiveMusicGenerationConfig(bpm=120, temperature=1.0))
+                    await session.set_music_generation_config(
+                        config=types.LiveMusicGenerationConfig(bpm=120, temperature=1.0)
+                    )
                     await session.play()
-                    print("Запись аудиопотока...")
+                    logger.info("Recording audio stream...")
                     start_time = time.time()
                     async for message in session.receive():
-                        if message.server_content and message.server_content.audio_chunks:
-                            for chunk in message.server_content.audio_chunks:
+                        sc = getattr(message, "server_content", None)
+                        setup = getattr(sc, "setup", None) if sc else None
+                        if setup is not None:
+                            # Read actual audio params from the API handshake
+                            # instead of hard-coding them (item 16).
+                            framerate = getattr(setup, "audio_sample_rate", None) or framerate
+                            channels = getattr(setup, "input_audio_channels", None) or channels
+                        if sc and getattr(sc, "audio_chunks", None):
+                            for chunk in sc.audio_chunks:
                                 audio_buffer.extend(chunk.data)
                         if time.time() - start_time > duration_seconds:
                             break
-                    print("Генерация аудио завершена.")
-                    return audio_buffer
-            except Exception as e:
-                print(f"Ошибка в сессии Lyria: {e}")
+                    logger.info("Audio generation finished.")
+                    return bytes(audio_buffer), framerate, channels, sample_width
+            except Exception as e:  # noqa: BLE001
+                logger.error("Lyria session error: %s", e)
                 return None
 
         try:
-            audio_data = asyncio.run(run_audio_session())
-            if audio_data:
-                with wave.open(output_filename, 'wb') as wf:
-                    wf.setnchannels(2)
-                    wf.setsampwidth(2)
-                    wf.setframerate(48000)
+            result = asyncio.run(run_audio_session())
+            if result:
+                audio_data, framerate, channels, sample_width = result
+                with wave.open(output_filename, "wb") as wf:
+                    wf.setnchannels(channels)
+                    wf.setsampwidth(sample_width)
+                    wf.setframerate(framerate)
                     wf.writeframes(audio_data)
-                print(f"Аудио сохранено: {output_filename}")
+                logger.info("Audio saved: %s", output_filename)
                 return output_filename
-            else:
-                return None
-        except Exception as e:
-            print(f"Ошибка при запуске генерации аудио: {e}")
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.error("Audio generation launch failed: %s", e)
             return None
 
-# --- Main Application Controller ---
+
+# --- Orchestrator: shared high-level flows for CLI and GUI ---
+
+
+class GenerationOrchestrator:
+    """High-level workflows (single, chain, batch, bridge) reused by frontends.
+
+    All progress reporting goes through the injected ``log_fn`` callback so the
+    CLI can print to stdout while the GUI routes messages to its console widget
+    without monkey-patching ``sys.stdout`` (item 2).
+    """
+
+    def __init__(self, ai: Optional[GenAIService] = None, log_fn: Optional[Callable[[str], None]] = None):
+        self.ai = ai or GenAIService()
+        self.log = log_fn or (lambda msg: print(msg, flush=True))
+
+    # ---------- single ----------
+
+    def single_video(
+        self,
+        prompt: str,
+        output_filename: Optional[str] = None,
+        *,
+        aspect_ratio: str = "16:9",
+        resolution: str = "720p",
+        duration_seconds: Optional[int] = None,
+        negative_prompt: Optional[str] = None,
+        auto_negative: Optional[bool] = None,
+        template: Optional[str] = None,
+        expand: bool = False,
+        image_path: Optional[str] = None,
+        last_frame_path: Optional[str] = None,
+        reference_image_paths: Optional[list[str]] = None,
+    ) -> Optional[str]:
+        if expand:
+            expanded = self.ai.expand_prompt(prompt)
+            if expanded:
+                self.log(f"Expanded prompt: {expanded}")
+                prompt = expanded
+        if template:
+            prompt = FileManager.apply_template(template, prompt)
+
+        use_auto = Config.GENERATE_NEGATIVE_PROMPT if auto_negative is None else auto_negative
+        if not negative_prompt and use_auto:
+            self.log("Auto-generating negative prompt...")
+            negative_prompt = self.ai.generate_negative_prompt(prompt)
+            if negative_prompt:
+                self.log(f"Negative prompt: {negative_prompt}")
+
+        if output_filename is None:
+            output_filename = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "veo_video", ".mp4")
+
+        return self.ai.generate_video(
+            prompt,
+            output_filename,
+            image_path=image_path,
+            last_frame_path=last_frame_path,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            duration_seconds=duration_seconds,
+            negative_prompt=negative_prompt,
+            reference_image_paths=reference_image_paths,
+        )
+
+    # ---------- batch (concurrent, item 10) ----------
+
+    def batch_generate(self, prompts: list[str], resolution: str = "720p", max_workers: Optional[int] = None) -> list[Optional[str]]:
+        results: list[Optional[str]] = [None] * len(prompts)
+        workers = max_workers or Config.BATCH_WORKERS
+
+        def job(idx_prompt: tuple[int, str]) -> None:
+            idx, p = idx_prompt
+            fname = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], f"batch_{idx + 1}", ".mp4")
+            try:
+                results[idx] = self.ai.generate_video(p, fname, resolution=resolution)
+            except Exception as e:  # noqa: BLE001
+                self.log(f"Batch item {idx + 1} failed: {e}")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(job, list(enumerate(prompts))))
+
+        ok = sum(1 for r in results if r)
+        self.log(f"Batch finished: {ok}/{len(prompts)} succeeded.")
+        return results
+
+    # ---------- chain (with resume, item 15) ----------
+
+    def run_chain(
+        self,
+        prompts: list[str],
+        *,
+        aspect_ratio: str = "16:9",
+        resolution: str = "720p",
+        start_image: Optional[str] = None,
+        final_name: Optional[str] = None,
+    ) -> Optional[str]:
+        """Generate a chain where each segment starts from the previous last frame.
+
+        State is persisted after every successful link so an interrupted chain
+        can be resumed with :meth:`resume_chain`.
+        """
+        if not prompts:
+            self.log("Chain requires at least one prompt.")
+            return None
+
+        video_chain: list[str] = []
+        temp_files: list[str] = []
+        remaining = list(prompts)
+
+        first_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "chain_segment_1", ".mp4")
+        kwargs = dict(aspect_ratio=aspect_ratio, resolution=resolution)
+        v = self.ai.generate_video(remaining.pop(0), first_name, image_path=start_image, **kwargs)
+        if not v:
+            self.log("First chain segment failed.")
+            return None
+        video_chain.append(v)
+        temp_files.append(v)
+        FileManager.save_resume_state({"prompts": remaining, "chain": video_chain, "temp_files": temp_files,
+                                       "aspect_ratio": aspect_ratio, "resolution": resolution})
+
+        for i, p in enumerate(remaining):
+            last_frame_path = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], f"temp_frame_{i}", ".png")
+            if not MediaProcessor.extract_frame(video_chain[-1], last_frame_path, "last"):
+                self.log("Frame extraction failed; stopping chain (state saved for resume).")
+                return None
+            temp_files.append(last_frame_path)
+            next_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], f"chain_segment_{i + 2}", ".mp4")
+            v_next = self.ai.generate_video(p or "Continue the action, high quality", next_name,
+                                            image_path=last_frame_path, **kwargs)
+            if not v_next:
+                self.log(f"Segment {i + 2} failed; partial chain kept (state saved for resume).")
+                remaining = remaining[i:]
+                FileManager.save_resume_state({"prompts": remaining, "chain": video_chain,
+                                               "temp_files": temp_files, **kwargs})
+                break
+            video_chain.append(v_next)
+            temp_files.append(v_next)
+            FileManager.save_resume_state({"prompts": [], "chain": video_chain, "temp_files": temp_files, **kwargs})
+
+        stitched = self._finalize_chain(video_chain, temp_files, final_name)
+        if stitched:
+            FileManager.clear_resume_state()
+        return stitched
+
+    def resume_chain(self, final_name: Optional[str] = None) -> Optional[str]:
+        state = FileManager.load_resume_state()
+        if not state:
+            self.log("No saved chain state found.")
+            return None
+        pending = state.get("prompts") or []
+        if pending:
+            self.log(f"Resuming chain: {len(pending)} segments remaining.")
+            # Continue from the last successfully generated segment's frame.
+            last_seg = (state.get("chain") or [None])[-1]
+            start_image = None
+            if last_seg and os.path.exists(last_seg):
+                start_image = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "resume_frame", ".png")
+                if not MediaProcessor.extract_frame(last_seg, start_image, "last"):
+                    start_image = None
+            return self.run_chain(
+                pending,
+                aspect_ratio=state.get("aspect_ratio", "16:9"),
+                resolution=state.get("resolution", "720p"),
+                start_image=start_image,
+                final_name=final_name,
+            )
+        # Nothing pending: just stitch what we have.
+        return self._finalize_chain(state.get("chain", []), state.get("temp_files", []), final_name)
+
+    def _finalize_chain(self, video_chain: list[str], temp_files: list[str], final_name: Optional[str]) -> Optional[str]:
+        if not video_chain:
+            self.log("Chain is empty.")
+            return None
+        if final_name is None:
+            final_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "full_chain", ".mp4")
+        if len(video_chain) > 1:
+            out = MediaProcessor.concatenate_videos(video_chain, final_name)
+        else:
+            try:
+                shutil.copy(video_chain[0], final_name)
+                self.log(f"Video saved: {final_name}")
+                out = final_name
+            except OSError as e:
+                self.log(f"Copy failed: {e}")
+                out = None
+        FileManager.cleanup_files(temp_files)
+        return out
+
+    # ---------- bridge (shared by CLI & GUI, items 1, 8) ----------
+
+    def bridge_step1_prepare(
+        self,
+        v1_path: str,
+        v2_path_or_none: Optional[str],
+        v2_prompt: Optional[str],
+        bridge_prompt: Optional[str],
+        *,
+        aspect_ratio: str = "16:9",
+        resolution: str = "720p",
+    ) -> Optional[dict]:
+        """Extract frames and generate the bridge clip between two videos.
+
+        Returns a bridge-state dict for :meth:`bridge_stitch_preview` /
+        :meth:`bridge_regen_v2`, or ``None`` on failure.
+        """
+        if not v1_path or not os.path.exists(v1_path):
+            self.log("Error: Video 1 not found.")
+            return None
+
+        state: dict = {
+            "p1": v1_path,
+            "bridge": None,
+            "v2_type": None,
+            "v2_path": None,
+            "preview": None,
+            "temp_files": [],
+            "aspect_ratio": aspect_ratio,
+            "resolution": resolution,
+        }
+
+        if v2_path_or_none and os.path.exists(v2_path_or_none):
+            state["v2_type"] = "existing"
+            state["v2_path"] = v2_path_or_none
+        else:
+            if not v2_prompt:
+                self.log("Error: provide Video 2 path OR prompt.")
+                return None
+            self.log("Generating initial Video 2...")
+            v2_file = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "bridge_v2", ".mp4")
+            v = self.ai.generate_video(v2_prompt, v2_file, aspect_ratio=aspect_ratio, resolution=resolution)
+            if not v:
+                return None
+            state["v2_type"] = "generated"
+            state["v2_path"] = v
+            state["temp_files"].append(v)
+
+        f1 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "bridge_start", ".png")
+        f2 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "bridge_end", ".png")
+        state["temp_files"].extend([f1, f2])
+
+        if not (MediaProcessor.extract_frame(state["p1"], f1, "last")
+                and MediaProcessor.extract_frame(state["v2_path"], f2, "first")):
+            self.log("Frame extraction failed.")
+            FileManager.cleanup_files(state["temp_files"])
+            return None
+
+        b_prompt = bridge_prompt or "Smooth transition between the two scenes, cinematic"
+        b_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "bridge_seg", ".mp4")
+        if not self.ai.generate_video(b_prompt, b_name, image_path=f1, last_frame_path=f2,
+                                      aspect_ratio=aspect_ratio, resolution=resolution):
+            self.log("Bridge generation failed.")
+            FileManager.cleanup_files(state["temp_files"])
+            return None
+
+        state["bridge"] = b_name
+        state["temp_files"].append(b_name)
+        return state
+
+    def bridge_stitch_preview(self, state: dict) -> Optional[str]:
+        preview_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "preview_stitched", ".mp4")
+        files = [state["p1"], state["bridge"], state["v2_path"]]
+        if MediaProcessor.concatenate_videos(files, preview_name):
+            state["preview"] = preview_name
+            self.log(f"Preview ready: {preview_name}")
+            return preview_name
+        self.log("Stitching failed.")
+        return None
+
+    def bridge_regen_v2(self, state: dict, new_v2_prompt: str) -> Optional[str]:
+        """Regenerate Video 2 starting from the bridge's last frame."""
+        if not new_v2_prompt:
+            self.log("Please provide a prompt for the new Video 2.")
+            return None
+
+        if state.get("preview") and os.path.exists(state["preview"]):
+            try:
+                os.remove(state["preview"])
+            except OSError as e:
+                logger.warning("Could not remove old preview: %s", e)
+            state["preview"] = None
+
+        if state["v2_type"] == "generated" and state.get("v2_path") and os.path.exists(state["v2_path"]):
+            try:
+                os.remove(state["v2_path"])
+            except OSError as e:
+                logger.warning("Could not remove old V2: %s", e)
+
+        bridge_end_frame = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "bridge_last_frame", ".png")
+        state["temp_files"].append(bridge_end_frame)
+
+        if not MediaProcessor.extract_frame(state["bridge"], bridge_end_frame, "last"):
+            self.log("Bridge frame extraction failed.")
+            return None
+
+        new_v2 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "v2_regen", ".mp4")
+        v = self.ai.generate_video(new_v2_prompt, new_v2, image_path=bridge_end_frame,
+                                   aspect_ratio=state.get("aspect_ratio", "16:9"),
+                                   resolution=state.get("resolution", "720p"))
+        if not v:
+            self.log("Regeneration failed; keeping previous Video 2.")
+            return None
+        state["v2_path"] = new_v2
+        state["v2_type"] = "generated"
+        state["temp_files"].append(new_v2)
+        return new_v2
+
+    def bridge_accept(self, state: dict, dest: Optional[str] = None) -> Optional[str]:
+        """Move the accepted preview to its final destination and clean temps."""
+        if not state.get("preview") or not os.path.exists(state["preview"]):
+            self.log("No preview available to save.")
+            return None
+        if dest is None:
+            dest = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "final_bridged_video", ".mp4")
+        try:
+            shutil.move(state["preview"], dest)
+            self.log(f"Saved as {dest}")
+        except OSError as e:
+            self.log(f"Move failed ({e}); copying instead.")
+            try:
+                shutil.copy(state["preview"], dest)
+            except OSError as e2:
+                self.log(f"Copy failed too: {e2}")
+                return None
+        FileManager.cleanup_files(state.get("temp_files", []))
+        if state.get("preview") and os.path.exists(state["preview"]):
+            try:
+                os.remove(state["preview"])
+            except OSError:
+                pass
+        return dest
+
+    @staticmethod
+    def open_in_player(path: str) -> None:
+        """Open a media file with the OS default player (item 12)."""
+        if not path or not os.path.exists(path):
+            raise FileNotFoundError(path)
+        opener = {"win32": "start", "darwin": "open"}.get(sys.platform, "xdg-open")
+        if sys.platform == "win32":
+            os.startfile(path)  # type: ignore[attr-defined]
+        else:
+            subprocess.Popen([opener, path])  # noqa: S603
+
+
+# --- Main Application Controller (CLI) ---
+
+
 class VeoGeneratorApp:
-    def __init__(self):
+    """Interactive terminal frontend built on top of the orchestrator."""
+
+    def __init__(self, orchestrator: Optional[GenerationOrchestrator] = None):
         Config.ensure_dirs()
-        self.ai = GenAIService()
+        self.orch = orchestrator or GenerationOrchestrator()
         self.running = True
 
-    def run(self):
+    def run(self) -> None:
         while self.running:
-            print("\n=== Veo3 Pro Generator (Refactored) ===")
-            print("1. Одиночное видео (Text-to-Video)")
-            print("2. Цепочка видео (Склейка)")
-            print("3. Генерация изображения (Text-to-Image)")
-            print("4. Батч режим")
-            print("5. Генерация аудио (Lyria)")
-            print("6. Мост между видео (Interpolation with Verification)")
-            print("0. Выход")
-            
-            choice = input("Выберите режим: ")
+            try:
+                self._menu_once()
+            except KeyboardInterrupt:
+                print("\nInterrupted by user. Returning to menu...")
+            except EOFError:
+                print("\nNo more input; exiting.")
+                self.running = False
 
-            if choice == "0": self.running = False
-            elif choice == "1": self.handle_single_video()
-            elif choice == "2": self.handle_chain_mode()
-            elif choice == "3": self.handle_image_gen()
-            elif choice == "4": self.handle_batch_mode()
-            elif choice == "5": self.handle_audio_gen()
-            elif choice == "6": self.handle_bridge_mode()
+    def _menu_once(self) -> None:
+        print("\n=== Veo3 Pro Generator ===")
+        print("1. Single video (Text-to-Video)")
+        print("2. Video chain (concatenated)")
+        print("3. Image generation (Text-to-Image)")
+        print("4. Batch mode")
+        print("5. Audio generation (Lyria)")
+        print("6. Bridge between videos (Interpolation with Verification)")
+        print("7. Resume interrupted chain")
+        print("8. Show prompt history")
+        print("0. Exit")
 
-    def _ask_resolution(self):
-        print("Разрешение:")
-        print("1. 720p (Быстро, меньше квоты)")
+        choice = input("Select mode: ")
+
+        if choice == "0":
+            self.running = False
+        elif choice == "1":
+            self.handle_single_video()
+        elif choice == "2":
+            self.handle_chain_mode()
+        elif choice == "3":
+            self.handle_image_gen()
+        elif choice == "4":
+            self.handle_batch_mode()
+        elif choice == "5":
+            self.handle_audio_gen()
+        elif choice == "6":
+            self.handle_bridge_mode()
+        elif choice == "7":
+            print(self.orch.resume_chain() or "Nothing to resume.")
+        elif choice == "8":
+            for h in FileManager.load_history(20):
+                print(f"[{h['ts']}] ({h['kind']}) {h['prompt'][:80]}")
+
+    def _ask_resolution(self) -> str:
+        print("Resolution:")
+        print("1. 720p (fast, less quota)")
         print("2. 1080p (HD)")
-        print("3. 4k (UHD)") 
-        c = input("Выбор (1): ")
-        if c == "2": return "1080p"
-        if c == "3": return "4k"
+        print("3. 4k (UHD)")
+        c = input("Choice (1): ")
+        if c == "2":
+            return "1080p"
+        if c == "3":
+            return "4k"
         return "720p"
 
-    def _configure_advanced_options(self, prompt):
-        """Ask for negative prompt, references, etc."""
-        # 1. Negative Prompt
-        neg = input("Negative Prompt (Enter для авто-генерации): ").strip()
-        if not neg:
-            print("Генерация негативного промпта...")
-            neg = self.ai.generate_negative_prompt(prompt)
-            print(f"Использован негативный промпт: {neg}")
-        
-        # 2. Reference Images
-        refs = []
-        c_ref = input("Добавить reference images? (y/n): ").lower()
-        if c_ref == 'y':
-            print("Введите пути к изображениям (до 3), пустая строка для завершения:")
+    def _configure_advanced_options(self, prompt: str) -> tuple[Optional[str], list[str], Optional[str]]:
+        neg: Optional[str] = None
+        if Config.GENERATE_NEGATIVE_PROMPT:
+            neg = input("Negative Prompt (Enter for auto-generation): ").strip() or None
+            if not neg:
+                print("Generating negative prompt...")
+                neg = self.orch.ai.generate_negative_prompt(prompt)
+                print(f"Using negative prompt: {neg}")
+
+        refs: list[str] = []
+        c_ref = input("Add reference images? (y/n): ").lower()
+        if c_ref == "y":
+            print("Enter image paths (max 3); empty line to finish:")
             while len(refs) < 3:
-                p_ref = input(f"Image {len(refs)+1}: ").strip('"').strip()
-                if not p_ref: break
+                p_ref = input(f"Image {len(refs) + 1}: ").strip('"').strip()
+                if not p_ref:
+                    break
                 if os.path.exists(p_ref):
                     refs.append(p_ref)
                 else:
-                    print("Файл не найден.")
+                    print("File not found.")
 
-        # 3. Last Frame (Constraint)
         last_frame = None
-        c_last = input("Задать Last Frame (концовку)? (1-Файл, 2-Сгенерировать, Enter-Нет): ")
+        c_last = input("Set Last Frame (ending)? (1-File, 2-Generate, Enter-No): ")
         if c_last == "1":
-            p_last = input("Путь к файлу: ").strip('"').strip()
+            p_last = input("File path: ").strip('"').strip()
             if os.path.exists(p_last):
                 last_frame = p_last
         elif c_last == "2":
-            p_gen = input("Промпт для генерации концовки: ")
+            p_gen = input("Prompt to generate the ending frame: ")
             fname = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "gen_last_frame", ".png")
-            last_frame = self.ai.generate_image(p_gen, fname)
-            
+            last_frame = self.orch.ai.generate_image(p_gen, fname)
+
         return neg, refs, last_frame
 
-    def handle_single_video(self):
-        prompt = input("Промпт: ")
-        fname = FileManager.ask_for_filename("Имя файла (Enter для авто): ", "veo_video", Config.OUTPUT_DIRS["video"], ".mp4")
-        ar = input("Формат (1 - 16:9, 2 - 9:16): ")
+    def handle_single_video(self) -> None:
+        prompt = input("Prompt: ")
+        fname = FileManager.ask_for_filename("File name (Enter for auto): ", "veo_video", Config.OUTPUT_DIRS["video"], ".mp4")
+        ar = input("Format (1 - 16:9, 2 - 9:16): ")
         ratio = "9:16" if ar == "2" else "16:9"
         res = self._ask_resolution()
-        
+        dur = input("Duration seconds (Enter = default 8): ").strip()
+        duration = int(dur) if dur.isdigit() else None
+
         neg, refs, last_frame = self._configure_advanced_options(prompt)
-        
-        self.ai.generate_video(prompt, fname, aspect_ratio=ratio, resolution=res, negative_prompt=neg, reference_image_paths=refs, last_frame_path=last_frame)
 
-    def handle_image_gen(self):
-        p = input("Промпт: ")
-        fname = FileManager.ask_for_filename("Имя файла: ", "generated_image", Config.OUTPUT_DIRS["image"], ".png")
-        self.ai.generate_image(p, fname)
+        self.orch.single_video(prompt, fname, aspect_ratio=ratio, resolution=res,
+                               duration_seconds=duration, negative_prompt=neg,
+                               reference_image_paths=refs, last_frame_path=last_frame)
 
-    def handle_audio_gen(self):
-        p = input("Промпт: ")
+    def handle_image_gen(self) -> None:
+        p = input("Prompt: ")
+        fname = FileManager.ask_for_filename("File name: ", "generated_image", Config.OUTPUT_DIRS["image"], ".png")
+        self.orch.ai.generate_image(p, fname)
+
+    def handle_audio_gen(self) -> None:
+        p = input("Prompt: ")
         sec = 10
-        try: sec = int(input("Сек (10): "))
-        except: pass
-        fname = FileManager.ask_for_filename("Имя файла: ", "audio", Config.OUTPUT_DIRS["audio"], ".wav")
-        self.ai.generate_audio(p, sec, fname)
+        raw = input("Seconds (10): ")
+        if raw.strip():
+            try:
+                sec = int(raw)
+            except ValueError:
+                print("Invalid number; using 10.")
+        fname = FileManager.ask_for_filename("File name: ", "audio", Config.OUTPUT_DIRS["audio"], ".wav")
+        self.orch.ai.generate_audio(p, sec, fname)
 
-    def handle_batch_mode(self):
-        print("1. Из списка промптов\n2. Склейка готовых видео")
-        sub = input("Выбор: ")
-        
+    def handle_batch_mode(self) -> None:
+        print("1. From prompt list\n2. Concatenate existing videos")
+        sub = input("Choice: ")
+
         if sub == "1":
-            raw = input("Промпты через ';': ")
-            prompts = [x.strip() for x in raw.split(';') if x.strip()]
+            raw = input("Prompts separated by ';': ")
+            prompts = [x.strip() for x in raw.split(";") if x.strip()]
             res = self._ask_resolution()
-            for i, p in enumerate(prompts):
-                fname = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], f"batch_{i+1}", ".mp4")
-                self.ai.generate_video(p, fname, resolution=res)
-        
+            self.orch.batch_generate(prompts, resolution=res)
+
         elif sub == "2":
-            print(f"Видео должны быть в папке: {Config.OUTPUT_DIRS['video']}")
-            names = input("Имена файлов (без .mp4) через запятую: ")
+            print(f"Videos must be located in: {Config.OUTPUT_DIRS['video']}")
+            names = input("File names (without .mp4), comma-separated: ")
             files = []
-            for n in names.split(','):
+            for n in names.split(","):
                 n = n.strip()
                 path = os.path.join(Config.OUTPUT_DIRS["video"], n + ".mp4")
                 if os.path.exists(path):
                     files.append(path)
                 else:
-                    print(f"Не найден: {n}")
-            
+                    print(f"Not found: {n}")
+
             if len(files) > 1:
-                out = FileManager.ask_for_filename("Имя итогового файла: ", "batch_concat", Config.OUTPUT_DIRS["video"], ".mp4")
+                out = FileManager.ask_for_filename("Final file name: ", "batch_concat", Config.OUTPUT_DIRS["video"], ".mp4")
                 MediaProcessor.concatenate_videos(files, out)
 
-    def handle_chain_mode(self):
-        print("\n--- Режим цепочки ---")
-        ar = input("Формат для всей цепочки (1 - 16:9, 2 - 9:16): ")
+    def handle_chain_mode(self) -> None:
+        print("\n--- Chain mode ---")
+        ar = input("Format for the whole chain (1 - 16:9, 2 - 9:16): ")
         ratio = "9:16" if ar == "2" else "16:9"
         res = self._ask_resolution()
 
-        start_opt = input("Начало: 1-Текст, 2-Сгенер. фото, 3-Свой файл: ")
-        
-        video_chain = []
-        temp_files = [] 
-        
-        first_vid_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "chain_segment_1", ".mp4")
-        
-        if start_opt == "1":
-            p = input("Промпт для 1 видео: ")
-            neg, refs, last_frame = self._configure_advanced_options(p)
-            v = self.ai.generate_video(p, first_vid_name, aspect_ratio=ratio, resolution=res, negative_prompt=neg, reference_image_paths=refs, last_frame_path=last_frame)
-            if v: 
-                video_chain.append(v)
-                temp_files.append(v)
-        elif start_opt == "2":
-            p = input("Промпт для фото: ")
-            img_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "chain_start_gen", ".png")
-            img = self.ai.generate_image(p, img_name)
-            if img:
-                temp_files.append(img)
-                p_vid = input("Промпт для видео: ")
-                neg, refs, last_frame = self._configure_advanced_options(p_vid)
-                v = self.ai.generate_video(p_vid, first_vid_name, image_path=img, aspect_ratio=ratio, resolution=res, negative_prompt=neg, reference_image_paths=refs, last_frame_path=last_frame)
-                if v:
-                    video_chain.append(v)
-                    temp_files.append(v)
-        elif start_opt == "3":
-            path = input("Путь к фото: ").strip('"')
-            if os.path.exists(path):
-                p_vid = input("Промпт для видео: ")
-                neg, refs, last_frame = self._configure_advanced_options(p_vid)
-                v = self.ai.generate_video(p_vid, first_vid_name, image_path=path, aspect_ratio=ratio, resolution=res, negative_prompt=neg, reference_image_paths=refs, last_frame_path=last_frame)
-                if v:
-                    video_chain.append(v)
-                    temp_files.append(v)
+        prompts: list[str] = [input("Prompt for video 1: ")]
+        extra = input("How many additional links? ")
+        n = int(extra) if extra.strip().isdigit() else 0
+        for _ in range(n):
+            prompts.append(input("Next prompt (Enter = continue action): ") or "Continue the action, high quality")
 
-        if video_chain:
-            try: n = int(input("Сколько еще звеньев добавить? "))
-            except: n = 0
-            
-            for i in range(n):
-                print(f"\n--- Звено {i+2} ---")
-                last_vid = video_chain[-1]
-                last_frame_path = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], f"temp_frame_{i}", ".png")
-                
-                if MediaProcessor.extract_frame(last_vid, last_frame_path, "last"):
-                    temp_files.append(last_frame_path)
-                    prompt = input("Промпт (Enter = продолжить действие): ")
-                    if not prompt: prompt = "Continue the action, high quality"
-                    
-                    # For subsequent links, we might want fewer advanced options or ask again?
-                    # Let's keep it simple: Just negative prompt auto-gen or same? 
-                    # User asked for features generally. Let's allow full config.
-                    neg, refs, last_frame = self._configure_advanced_options(prompt)
+        start_image = None
+        start_opt = input("Start with own image? (y/n): ").lower()
+        if start_opt == "y":
+            p = input("Path to image: ").strip('"')
+            if os.path.exists(p):
+                start_image = p
 
-                    next_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], f"chain_segment_{i+2}", ".mp4")
-                    v_next = self.ai.generate_video(prompt, next_name, image_path=last_frame_path, aspect_ratio=ratio, resolution=res, negative_prompt=neg, reference_image_paths=refs, last_frame_path=last_frame)
-                    if v_next:
-                        video_chain.append(v_next)
-                        temp_files.append(v_next)
-                    else: break
-                else: break
-            
-            if len(video_chain) > 0:
-                final_name = FileManager.ask_for_filename("Имя итогового видео: ", "full_chain", Config.OUTPUT_DIRS["video"], ".mp4")
-                if len(video_chain) > 1:
-                    MediaProcessor.concatenate_videos(video_chain, final_name)
-                else:
-                    shutil.copy(video_chain[0], final_name)
-                    print(f"Видео сохранено: {final_name}")
-                FileManager.cleanup_files(temp_files)
-        else:
-            print("Цепочка прервана.")
+        final_name = FileManager.ask_for_filename("Final video name: ", "full_chain", Config.OUTPUT_DIRS["video"], ".mp4")
+        out = self.orch.run_chain(prompts, aspect_ratio=ratio, resolution=res,
+                                  start_image=start_image, final_name=final_name)
+        print(f"Result: {out}" if out else "Chain interrupted (use 'Resume' from menu).")
 
-    def handle_bridge_mode(self):
+    def handle_bridge_mode(self) -> None:
         print("\n--- Interpolation / Bridge with Verification ---")
-        print(f"Укажите название видео 1 (Начало) из папки {Config.OUTPUT_DIRS['video']}")
-        n1 = input("Видео 1: ").strip()
-        p1 = os.path.join(Config.OUTPUT_DIRS["video"], n1 + ".mp4") if not n1.endswith(".mp4") else os.path.join(Config.OUTPUT_DIRS["video"], n1)
+        print(f"Video 1 name from folder {Config.OUTPUT_DIRS['video']}")
+        n1 = input("Video 1: ").strip()
+        p1 = os.path.join(Config.OUTPUT_DIRS["video"], n1 if n1.endswith(".mp4") else n1 + ".mp4")
         if not os.path.exists(p1):
-            print("Видео 1 не найдено.")
+            print("Video 1 not found.")
             return
 
-        ar = input("Формат (1 - 16:9, 2 - 9:16): ")
+        ar = input("Format (1 - 16:9, 2 - 9:16): ")
         ratio = "9:16" if ar == "2" else "16:9"
         res = self._ask_resolution()
 
-        print("2. Видео 2 (Конец):\n   1. Выбрать существующее видео\n   2. Сгенерировать новое видео")
-        v2_choice = input("Выбор: ")
-        
-        p2 = None
-        is_v2_generated = False
-        temp_files = []
-
+        print("2. Video 2 (End):\n   1. Existing video\n   2. Generate new")
+        v2_choice = input("Choice: ")
+        v2_existing: Optional[str] = None
+        v2_prompt: Optional[str] = None
         if v2_choice == "1":
-            n2 = input("Видео 2: ").strip()
-            p2 = os.path.join(Config.OUTPUT_DIRS["video"], n2 + ".mp4") if not n2.endswith(".mp4") else os.path.join(Config.OUTPUT_DIRS["video"], n2)
-            if not os.path.exists(p2):
-                print("Видео 2 не найдено.")
+            n2 = input("Video 2: ").strip()
+            v2_existing = os.path.join(Config.OUTPUT_DIRS["video"], n2 if n2.endswith(".mp4") else n2 + ".mp4")
+            if not os.path.exists(v2_existing):
+                print("Video 2 not found.")
                 return
         elif v2_choice == "2":
-            prompt_v2 = input("Промпт для Видео 2: ")
-            p2 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "temp_v2_initial", ".mp4")
-            if self.ai.generate_video(prompt_v2, p2, aspect_ratio=ratio, resolution=res):
-                is_v2_generated = True
-                temp_files.append(p2)
-            else: return
-        else: return
-
-        print("\n--- Генерация Моста ---")
-        f1 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "bridge_start", ".png")
-        f2 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "bridge_end", ".png")
-        temp_files.extend([f1, f2])
-
-        if not (MediaProcessor.extract_frame(p1, f1, "last") and MediaProcessor.extract_frame(p2, f2, "first")):
-            print("Ошибка извлечения кадров.")
+            v2_prompt = input("Prompt for Video 2: ")
+        else:
             return
 
-        prompt_bridge = input("Промпт перехода (Enter для авто): ")
-        if not prompt_bridge: prompt_bridge = "Smooth transition between the two scenes, cinematic"
-        
-        bridge_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "temp_bridge", ".mp4")
-        if not self.ai.generate_video(prompt_bridge, bridge_name, image_path=f1, last_frame_path=f2, aspect_ratio=ratio, resolution=res):
+        prompt_bridge = input("Transition prompt (Enter for auto): ") or None
+
+        state = self.orch.bridge_step1_prepare(p1, v2_existing, v2_prompt, prompt_bridge,
+                                               aspect_ratio=ratio, resolution=res)
+        if not state:
             return
-        
-        temp_files.append(bridge_name)
-        current_v2 = p2
-        
+
         while True:
-            preview_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "preview_stitched", ".mp4")
-            MediaProcessor.concatenate_videos([p1, bridge_name, current_v2], preview_name)
-            
-            print(f"\nГотово! Проверьте видео: {preview_name}")
-            print("Довольны результатом?")
-            print("1. Да, сохранить")
-            print("2. Нет, перегенерировать Видео 2 (используя конец моста)")
-            
-            dec = input("Выбор: ")
+            preview = self.orch.bridge_stitch_preview(state)
+            if not preview:
+                break
+            print(f"\nDone! Check the video: {preview}")
+            print("1. Yes, save")
+            print("2. No, regenerate Video 2 (using bridge end frame)")
+            dec = input("Choice: ")
             if dec == "1":
-                final_name = FileManager.ask_for_filename("Имя итогового файла: ", "final_bridged_video", Config.OUTPUT_DIRS["video"], ".mp4")
-                try:
-                    shutil.move(preview_name, final_name)
-                    print(f"Сохранено как {final_name}")
-                except Exception as e:
-                    print(f"Ошибка сохранения: {e}")
-                    shutil.copy(preview_name, final_name)
-                
-                FileManager.cleanup_files(temp_files)
-                if os.path.exists(preview_name): os.remove(preview_name)
-                if is_v2_generated and os.path.exists(current_v2):
-                    try: os.remove(current_v2)
-                    except: pass
+                final_name = FileManager.ask_for_filename("Final file name: ", "final_bridged_video",
+                                                          Config.OUTPUT_DIRS["video"], ".mp4")
+                self.orch.bridge_accept(state, final_name)
                 break
             elif dec == "2":
-                print("\n--- Регенерация Видео 2 ---")
-                if is_v2_generated and os.path.exists(current_v2):
-                    try: os.remove(current_v2)
-                    except: pass
-                
-                bridge_end_frame = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "bridge_last_frame", ".png")
-                temp_files.append(bridge_end_frame)
-                
-                if MediaProcessor.extract_frame(bridge_name, bridge_end_frame, "last"):
-                    p_new = input("Промпт для нового Видео 2: ")
-                    new_v2_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "temp_v2_regen", ".mp4")
-                    if self.ai.generate_video(p_new, new_v2_name, image_path=bridge_end_frame, aspect_ratio=ratio, resolution=res):
-                        current_v2 = new_v2_name
-                        is_v2_generated = True
-                    else:
-                        print("Ошибка генерации. Оставляем предыдущее видео.")
-                else:
-                    print("Ошибка извлечения кадра из моста.")
-                
-                if os.path.exists(preview_name):
-                    try: os.remove(preview_name)
-                    except: pass
+                p_new = input("Prompt for new Video 2: ")
+                if self.orch.bridge_regen_v2(state, p_new):
+                    continue
+                print("Keeping previous result; choose again.")
             else:
-                print("Неверный ввод.")
+                print("Invalid input.")
+
+
+def _setup_logging(verbose: bool = False) -> None:
+    level = logging.DEBUG if verbose else logging.INFO
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root = logging.getLogger("veo")
+    root.setLevel(level)
+    if not root.handlers:
+        root.addHandler(handler)
+    try:
+        os.makedirs(os.path.join(Config.BASE_DIR, "output"), exist_ok=True)
+        fh = logging.FileHandler(os.path.join(Config.BASE_DIR, "output", "veo.log"), encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+        root.addHandler(fh)
+    except OSError:
+        pass
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="veo-generator", description="Veo3 Pro Generator CLI")
+    parser.add_argument("--interactive", "-i", action="store_true", help="force interactive menu")
+    parser.add_argument("--verbose", "-v", action="store_true", help="debug logging")
+    sub = parser.add_subparsers(dest="command")
+
+    vid = sub.add_parser("video", help="one-shot video generation")
+    vid.add_argument("prompt")
+    vid.add_argument("--output")
+    vid.add_argument("--resolution", default="720p", choices=["720p", "1080p", "4k"])
+    vid.add_argument("--aspect-ratio", default="16:9", choices=["16:9", "9:16"])
+    vid.add_argument("--duration", type=int, default=None)
+    vid.add_argument("--image", default=None, help="start-frame image path")
+    vid.add_argument("--last-frame", default=None)
+    vid.add_argument("--negative-prompt", default=None)
+    vid.add_argument("--no-auto-negative", action="store_true", help="skip LLM negative-prompt call (saves quota)")
+    vid.add_argument("--template", default=None, help="apply a named prompt template")
+    vid.add_argument("--expand", action="store_true", help="expand prompt via LLM before generating")
+
+    img = sub.add_parser("image", help="one-shot image generation")
+    img.add_argument("prompt")
+    img.add_argument("--output")
+
+    aud = sub.add_parser("audio", help="one-shot music generation")
+    aud.add_argument("prompt")
+    aud.add_argument("--duration", type=int, default=10)
+    aud.add_argument("--output")
+
+    bat = sub.add_parser("batch", help="concurrent batch from a file (one prompt per line)")
+    bat.add_argument("prompts_file")
+    bat.add_argument("--resolution", default="720p")
+    bat.add_argument("--workers", type=int, default=None)
+
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    _setup_logging(getattr(args, "verbose", False))
+
+    try:
+        validate_api_key()
+    except ApiKeyError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        return 2
+
+    Config.ensure_dirs()
+    orch = GenerationOrchestrator()
+
+    if args.command == "video":
+        out = orch.single_video(
+            args.prompt, args.output,
+            aspect_ratio=args.aspect_ratio, resolution=args.resolution,
+            duration_seconds=args.duration, image_path=args.image,
+            last_frame_path=args.last_frame, negative_prompt=args.negative_prompt,
+            auto_negative=not args.no_auto_negative,
+            template=args.template, expand=args.expand,
+        )
+        return 0 if out else 1
+    if args.command == "image":
+        fname = args.output or FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "image", ".png")
+        return 0 if orch.ai.generate_image(args.prompt, fname) else 1
+    if args.command == "audio":
+        fname = args.output or FileManager.get_unique_filename(Config.OUTPUT_DIRS["audio"], "music", ".wav")
+        return 0 if orch.ai.generate_audio(args.prompt, args.duration, fname) else 1
+    if args.command == "batch":
+        try:
+            with open(args.prompts_file, "r", encoding="utf-8") as fh:
+                prompts = [ln.strip() for ln in fh if ln.strip()]
+        except OSError as e:
+            print(f"Cannot read prompts file: {e}", file=sys.stderr)
+            return 2
+        results = orch.batch_generate(prompts, resolution=args.resolution, max_workers=args.workers)
+        return 0 if all(results) else 1
+
+    # Default: interactive menu
+    app = VeoGeneratorApp(orch)
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        print("\nExiting on Ctrl+C; temporary files left in output/.")
+        return 130
+    return 0
+
 
 if __name__ == "__main__":
-    app = VeoGeneratorApp()
-    app.run()
+    sys.exit(main())
