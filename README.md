@@ -4,7 +4,24 @@ Advanced AI Media Generation tool powered by Google Gemini (Veo 3.1, Imagen 4, L
 
 ## 🚀 Installation & Setup
 
-1.  **Prerequisites**: Python 3.10+ installed.
+### Windows (recommended — one-click launch)
+
+1.  Install [Python 3.10+](https://www.python.org/downloads/) and **tick "Add python.exe to PATH"** during installation.
+2.  **Double-click `run.bat`** — that's it. On the first launch the script automatically:
+    *   finds Python, creates a `.venv` virtual environment;
+    *   installs all dependencies from `requirements.txt`;
+    *   starts the GUI. Every subsequent launch is instant.
+3.  Set up your API key: copy `.env.example` to `.env` (in Explorer just rename it and remove the leading name) and put your key inside:
+    ```env
+    GEMINI_API_KEY=your_google_api_key_here
+    ```
+    Get a free key at [Google AI Studio](https://aistudio.google.com/apikey). If the key is missing, `run.bat` will remind you how to create it.
+
+> 💡 ffmpeg is required for video stitching/frames. Install it with `winget install Gyan.FFmpeg` (or download from ffmpeg.org and add to PATH).
+
+### Any OS (manual setup)
+
+1.  **Prerequisites**: Python 3.10+ and ffmpeg installed.
 2.  **Clone the repository**:
     ```bash
     git clone https://github.com/kubiknubika/Veo3.git
@@ -15,20 +32,62 @@ Advanced AI Media Generation tool powered by Google Gemini (Veo 3.1, Imagen 4, L
     pip install -r requirements.txt
     ```
 4.  **Environment Setup**:
-    Create a `.env` file in the root directory and add your API key:
+    Create a `.env` file in the root directory (or copy `.env.example`) and add your API key:
     ```env
     GEMINI_API_KEY=your_google_api_key_here
     ```
 
 ## ▶️ Usage
 
-Run the main application using Python:
+**Windows launch options:**
+
+| File | What it does |
+|---|---|
+| **`run.bat`** | One-click GUI with a visible console — best for first run and troubleshooting (setup messages, API-key warnings and errors stay on screen). |
+| **`VeoGUI.vbs`** | Double-click GUI with **no console window** (uses `pythonw.exe`). First run still shows the setup console via `run.bat`. Right-click → *Send to → Desktop* to get a normal-looking shortcut. |
+| **`run-hidden.ps1`** | Same silent launch in PowerShell: `powershell -ExecutionPolicy Bypass -File run-hidden.ps1` (only needed if Windows blocks `.vbs` execution via AppLocker/WDAC). |
+| **`cli.bat`** | Command-line mode with arguments. |
+| **`build-exe.bat`** | Builds a standalone `dist\VeoGenerator\VeoGenerator.exe` (see below). Needs Python only on the *building* machine. |
+
+To use it **like an installed app**: right-click `VeoGUI.vbs` (or `run.bat`) → *Send to → Desktop (create shortcut)*, then rename the shortcut to "Veo3 Generator" and pin it to the taskbar/Start.
+
+Or create the shortcut automatically (icon, description, hotkey included) — run once in PowerShell:
 
 ```powershell
-python veo_generator.py
+$w = New-Object -ComObject WScript.Shell
+$s = $w.CreateShortcut("$env:USERPROFILE\Desktop\Veo3 Generator.lnk")
+$s.TargetPath = "$PWD\VeoGUI.vbs"
+$s.WorkingDirectory = "$PWD"
+$s.IconLocation = "$PWD\.venv\Scripts\pythonw.exe,0"
+$s.Description  = "Veo3 Pro Generator"
+$s.Save()
 ```
 
-*Note: You may want to create a `run.bat` or `run.sh` script locally to execute this with your specific Python environment path if needed.*
+The `.lnk` is a few hundred bytes and points at the repo folder; if you move the repo, recreate it.
+
+**Standalone .exe (no Python needed on the target PC)** — double-click **`build-exe.bat`** on your Windows machine. It reuses/creates `.venv`, installs PyInstaller into it and packages the app with `veo.spec`. Manual equivalent:
+
+```powershell
+.venv\Scripts\pip install pyinstaller
+.venv\Scripts\pyinstaller veo.spec --clean --noconfirm
+```
+
+Result: `dist\VeoGenerator\` folder (~100–200 MB). Copy that folder + a `.env` file with your key anywhere; double-click `VeoGenerator.exe`. Videos still go to `output\` next to the exe. If SmartScreen warns on first run, click *More info → Run anyway* (the build is unsigned). Note: ffmpeg must be on PATH on the target PC (or drop `ffmpeg.exe` next to the app).
+
+For the command line use **`cli.bat`**:
+
+```powershell
+cli.bat                              # interactive menu
+cli.bat video "a cat surfing waves"  # generate a single video
+cli.bat tasks                        # show task journal
+```
+
+**Any OS:** run the application with Python directly:
+
+```bash
+python veo_gui.py         # GUI
+python veo_generator.py   # CLI / interactive menu
+```
 
 ## ✨ Features
 

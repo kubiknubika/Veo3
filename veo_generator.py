@@ -43,8 +43,15 @@ from task_journal import TaskJournal
 class CancelledError(RuntimeError):
     """Raised inside worker threads when the user requests cancellation."""
 
-# Load environment variables from .env (config lives outside the code)
-load_dotenv()
+# Load environment variables from .env (config lives outside the code).
+# Explicit path: double-clicked launchers (.vbs / desktop shortcut) may start
+# with an unrelated working directory, and a frozen PyInstaller build has no
+# __file__ — resolve relative to the executable instead.
+if getattr(sys, "frozen", False):
+    _ENV_BASE = os.path.dirname(sys.executable)
+else:
+    _ENV_BASE = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(_ENV_BASE, ".env"))
 
 logger = logging.getLogger("veo")
 
