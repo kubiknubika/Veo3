@@ -38,6 +38,11 @@ if not exist "%VPY%" (
 if errorlevel 1 (
     echo [SETUP] Installing dependencies...
     "%VPY%" -m pip install -r requirements.txt
+    if errorlevel 1 (
+        echo [ERROR] Dependency installation failed. Check your internet connection.
+        pause
+        exit /b 1
+    )
 )
 
 "%VPY%" veo_generator.py %*

@@ -39,7 +39,18 @@ Advanced AI Media Generation tool powered by Google Gemini (Veo 3.1, Imagen 4, L
 
 ## ▶️ Usage
 
-**Windows:** just double-click **`run.bat`** (GUI) or use **`cli.bat`** for the command line:
+**Windows launch options:**
+
+| File | What it does |
+|---|---|
+| **`run.bat`** | One-click GUI with a visible console — best for first run and troubleshooting (setup messages, API-key warnings and errors stay on screen). |
+| **`VeoGUI.vbs`** | Double-click GUI with **no console window** (uses `pythonw.exe`). First run still shows the setup console via `run.bat`. Right-click → *Send to → Desktop* to get a normal-looking shortcut. |
+| **`run-hidden.ps1`** | Same silent launch in PowerShell: `powershell -ExecutionPolicy Bypass -File run-hidden.ps1` (only needed if Windows blocks `.vbs` execution via AppLocker/WDAC). |
+| **`cli.bat`** | Command-line mode with arguments. |
+
+To use it **like an installed app**: right-click `VeoGUI.vbs` (or `run.bat`) → *Send to → Desktop (create shortcut)*, then rename the shortcut to "Veo3 Generator" and pin it to the taskbar/Start.
+
+For the command line use **`cli.bat`**:
 
 ```powershell
 cli.bat                              # interactive menu
