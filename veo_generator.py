@@ -24,6 +24,7 @@ import random
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import wave
@@ -31,10 +32,17 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
 import cv2
+import numpy as np
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 from moviepy import VideoFileClip, concatenate_videoclips
+
+from task_journal import TaskJournal
+
+
+class CancelledError(RuntimeError):
+    """Raised inside worker threads when the user requests cancellation."""
 
 # Load environment variables from .env (config lives outside the code)
 load_dotenv()
@@ -65,6 +73,9 @@ class AppConfig:
     # Batch concurrency
     BATCH_WORKERS: int = int(os.getenv("VEO_BATCH_WORKERS", "3"))
 
+    # Upscale generated videos to 1080p after download (Veo 3.1 API flag)
+    UPSCALE_DEFAULT: bool = os.getenv("VEO_UPSCALE", "false").lower() in ("1", "true", "yes")
+
     # Generation defaults (Veo 3.1 supports durations in whole seconds 4-60)
     MIN_DURATION_S: int = int(os.getenv("VEO_MIN_DURATION", "4"))
     MAX_DURATION_S: int = int(os.getenv("VEO_MAX_DURATION", "60"))
@@ -84,6 +95,7 @@ class AppConfig:
     PROMPT_TEMPLATES_FILE: str = os.path.join(BASE_DIR, "prompt_templates.json")
     HISTORY_FILE: str = os.path.join(BASE_DIR, "output", "prompt_history.json")
     RESUME_FILE: str = os.path.join(BASE_DIR, "output", "resume_state.json")
+    TASKS_JOURNAL_FILE: str = os.path.join(BASE_DIR, "output", "tasks.jsonl")
 
     @property
     def OUTPUT_DIRS(self) -> dict[str, str]:
@@ -145,6 +157,7 @@ class FileManager:
     """Filename allocation, prompt history and resume-state persistence."""
 
     _history_lock = threading.Lock()
+    _resume_lock = threading.Lock()
 
     @staticmethod
     def get_unique_filename(folder: str, base_name: str, extension: str, strict: bool = False) -> str:
@@ -244,10 +257,28 @@ class FileManager:
 
     @staticmethod
     def save_resume_state(state: dict) -> None:
+        """Atomically persist chain resume state under a lock.
+
+        Written to a temp file in the same directory and moved over the
+        target so a crash mid-write can never corrupt the resume file,
+        even when batch worker threads run concurrently.
+        """
         try:
             os.makedirs(os.path.dirname(Config.RESUME_FILE), exist_ok=True)
-            with open(Config.RESUME_FILE, "w", encoding="utf-8") as fh:
-                json.dump(state, fh, ensure_ascii=False, indent=1)
+            with FileManager._resume_lock:
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=os.path.dirname(Config.RESUME_FILE), prefix=".resume_", suffix=".tmp"
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        json.dump(state, fh, ensure_ascii=False, indent=1)
+                    os.replace(tmp_path, Config.RESUME_FILE)
+                except BaseException:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                    raise
         except OSError as e:
             logger.warning("Failed to save resume state: %s", e)
 
@@ -314,15 +345,120 @@ class MediaProcessor:
             cap.release()
 
     @staticmethod
+    def extract_thumbnail(video_path: str, output_image_path: str, width: int = 320) -> Optional[str]:
+        """Save a small JPEG thumbnail (first frame) for GUI previews."""
+        cap = cv2.VideoCapture(video_path)
+        try:
+            if not cap.isOpened():
+                return None
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                return None
+            h, w = frame.shape[:2]
+            if w > width:
+                frame = cv2.resize(frame, (width, max(1, int(h * width / w))))
+            if cv2.imwrite(output_image_path, frame):
+                return output_image_path
+            return None
+        finally:
+            cap.release()
+
+    @staticmethod
+    def _probe_video(path: str) -> Optional[dict]:
+        """Return {w, h, fps} metadata of a video file, or None on failure."""
+        cap = cv2.VideoCapture(path)
+        try:
+            if not cap.isOpened():
+                return None
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+            if w <= 0 or h <= 0:
+                return None
+            return {"w": w, "h": h, "fps": float(fps)}
+        finally:
+            cap.release()
+
+    @staticmethod
+    def normalize_clip(path: str, target_w: int, target_h: int, target_fps: float) -> Optional[str]:
+        """Re-encode ``path`` to the target size/fps (letterboxed, no cropping).
+
+        Returns the normalized file path, or the original path when it
+        already matches the target, or ``None`` on failure.
+        """
+        meta = MediaProcessor._probe_video(path)
+        if meta is None:
+            return None
+        if meta["w"] == target_w and meta["h"] == target_h and abs(meta["fps"] - target_fps) < 0.5:
+            return path
+
+        out_path = os.path.join(
+            os.path.dirname(path), "_norm_" + os.path.basename(path)
+        )
+        clip = None
+        try:
+            clip = VideoFileClip(path)
+            # Preserve aspect ratio: scale to fit, then pad to the target canvas.
+            r = min(target_w / meta["w"], target_h / meta["h"])
+            new_w, new_h = max(2, int(meta["w"] * r) // 2 * 2), max(2, int(meta["h"] * r) // 2 * 2)
+            resized = clip.resized(height=new_h, width=new_w)
+            left = (target_w - new_w) // 2
+            top = (target_h - new_h) // 2
+            final = resized.on_color(
+                size=(target_w, target_h), color=(0, 0, 0),
+                pos=(max(0, left), max(0, top)),
+            )
+            final.write_videofile(out_path, fps=target_fps, codec="libx264", audio_codec="aac", logger=None)
+            logger.info("Normalized %s -> %dx%d@%.2ffps", os.path.basename(path), target_w, target_h, target_fps)
+            return out_path
+        except Exception as e:  # noqa: BLE001
+            logger.error("Normalization failed for %s: %s", path, e)
+            return None
+        finally:
+            if clip is not None:
+                try:
+                    clip.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    @staticmethod
     def concatenate_videos(video_paths: list[str], output_filename: str) -> Optional[str]:
-        """Concatenate video files, always releasing clip handles on error."""
+        """Concatenate video files with automatic normalization.
+
+        Veo can return clips with differing resolution/FPS (e.g. after an
+        upscale or across model revisions); concatenating such streams
+        produces desynchronized output. All clips are therefore re-encoded
+        to the geometry of the first clip before stitching. Handles are
+        always released, even on error.
+        """
         logger.info("Concatenating %d videos...", len(video_paths))
         clips: list[VideoFileClip] = []
         final_clip: Optional[VideoFileClip] = None
+        normalized_files: list[str] = []
         try:
-            clips = [VideoFileClip(path) for path in video_paths]
+            metas = [MediaProcessor._probe_video(p) for p in video_paths]
+            if any(m is None for m in metas):
+                raise RuntimeError("Could not probe one of the input videos")
+            assert metas and metas[0] is not None
+            tw, th = metas[0]["w"], metas[0]["h"]
+            tfps = sum(m["fps"] for m in metas) / len(metas)  # type: ignore[index]
+
+            use_paths: list[str] = []
+            for p, m in zip(video_paths, metas):
+                assert m is not None
+                if m["w"] == tw and m["h"] == th and abs(m["fps"] - tfps) < 0.5:
+                    use_paths.append(p)
+                    continue
+                norm = MediaProcessor.normalize_clip(p, tw, th, tfps)
+                if norm is None:
+                    raise RuntimeError(f"Normalization failed for {p}")
+                if norm != p:
+                    normalized_files.append(norm)
+                use_paths.append(norm)
+
+            clips = [VideoFileClip(path) for path in use_paths]
             final_clip = concatenate_videoclips(clips)
-            final_clip.write_videofile(output_filename, codec="libx264", audio_codec="aac")
+            final_clip.write_videofile(output_filename, codec="libx264", audio_codec="aac", logger=None)
             logger.info("Combined video saved: %s", output_filename)
             return output_filename
         except Exception as e:  # noqa: BLE001 - report and degrade gracefully
@@ -339,6 +475,12 @@ class MediaProcessor:
                     clip.close()
                 except Exception:  # noqa: BLE001
                     pass
+            for nf in normalized_files:
+                try:
+                    if os.path.exists(nf):
+                        os.remove(nf)
+                except OSError:
+                    pass
 
 
 # --- Generative AI Service ---
@@ -350,6 +492,21 @@ class GenAIService:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or validate_api_key()
         self.client = genai.Client(api_key=self.api_key)
+        # Cooperative cancellation: set the Event to abort in-flight work.
+        self.cancel_event: threading.Event = threading.Event()
+        # JSONL task journal (statistics / observability).
+        self._journal = TaskJournal(Config.TASKS_JOURNAL_FILE)
+
+    def cancel(self) -> None:
+        """Request cancellation of the current generation/polling loop."""
+        self.cancel_event.set()
+
+    def reset_cancel(self) -> None:
+        self.cancel_event.clear()
+
+    def _check_cancelled(self) -> None:
+        if self.cancel_event.is_set():
+            raise CancelledError("Cancelled by user")
 
     # ---- low-level helpers ----
 
@@ -364,7 +521,10 @@ class GenAIService:
         while True:
             try:
                 return fn()
+            except CancelledError:
+                raise
             except Exception as e:  # noqa: BLE001
+                self._check_cancelled()
                 attempt += 1
                 if attempt >= Config.MAX_RETRIES or not self._is_retryable(e):
                     raise
@@ -373,14 +533,28 @@ class GenAIService:
                                description, attempt, Config.MAX_RETRIES, e, delay)
                 time.sleep(delay)
 
-    def _await_operation(self, operation) -> None:
-        """Poll an LRO with timeout; raise on timeout or transport errors."""
+    def _await_operation(self, operation, progress_cb: Optional[Callable[[Optional[int]], None]] = None) -> None:
+        """Poll an LRO with timeout; raise on timeout, transport errors or cancel.
+
+        If the API exposes ``metadata.progress`` it is forwarded to
+        ``progress_cb`` so frontends can render a real progress bar.
+        """
         start = time.time()
+        last_pct: Optional[int] = None
         while not getattr(operation, "done", False):
+            self._check_cancelled()
             if time.time() - start > Config.POLL_TIMEOUT_S:
                 raise TimeoutError(f"Generation exceeded {Config.POLL_TIMEOUT_S:.0f}s timeout.")
+            meta = getattr(operation, "metadata", None)
+            pct = getattr(meta, "progress", None) if meta is not None else None
+            if isinstance(pct, int) and pct != last_pct:
+                last_pct = pct
+                if progress_cb:
+                    progress_cb(pct)
             time.sleep(Config.POLL_INTERVAL_S)
             operation = self.client.operations.get(operation)
+        if progress_cb:
+            progress_cb(100)
 
     def _get_image_param(self, image_path: str) -> Optional[types.Image]:
         """Read an image file and return a ``types.Image`` object."""
@@ -436,6 +610,24 @@ class GenAIService:
 
     # ---- generation ----
 
+    @staticmethod
+    def parse_reference_spec(spec: str) -> tuple[str, str]:
+        """Split a reference spec into (path, reference_type).
+
+        Explicit prefixes are preferred over filename heuristics:
+            ``style:/path/img.png`` or ``asset:/path/img.png``  -> prefix wins
+            ``/path/style_img.png``                             -> legacy heuristic (STYLE)
+            ``/path/img.png``                                   -> ASSET (default)
+        """
+        low = spec.lower()
+        for prefix, kind in (("style:", "STYLE"), ("asset:", "ASSET")):
+            if low.startswith(prefix):
+                return spec.split(":", 1)[1].strip(), kind
+        # Legacy heuristic kept for backwards compatibility.
+        if "style" in os.path.basename(spec).lower():
+            return spec, "STYLE"
+        return spec, "ASSET"
+
     def generate_video(
         self,
         prompt: str,
@@ -448,16 +640,21 @@ class GenAIService:
         generate_audio: bool = True,
         negative_prompt: Optional[str] = None,
         reference_image_paths: Optional[list[str]] = None,
+        upsampling: Optional[bool] = None,
+        progress_cb: Optional[Callable[[Optional[int]], None]] = None,
     ) -> Optional[str]:
         """Generate a single Veo clip. Returns the output path or ``None``.
 
         Parameter constraints follow the official Veo 3.1 docs:
         * resolution: 720p / 1080p (4k only for veo-3.1-generate-preview);
         * duration_seconds: whole seconds in [4, 60];
-        * reference images: ASSET up to 3, STYLE up to 3 per request.
+        * reference images: ASSET up to 3, STYLE up to 3 per request;
+        * upsampling: Veo 3.1 native 1080p/4k upscale pass (paid tier).
         """
         logger.info("Generating video: '%s' [%s, %s]", prompt, resolution, aspect_ratio)
         FileManager.record_prompt(prompt, "video", output_filename)
+        self._check_cancelled()
+        start = time.time()
 
         tokens = self.count_tokens(prompt)
         if tokens > Config.TOKEN_LIMIT:
@@ -470,6 +667,9 @@ class GenAIService:
                 "person_generation": "allow_adult",
                 "generate_audio": generate_audio,
             }
+            use_upscale = Config.UPSCALE_DEFAULT if upsampling is None else upsampling
+            if use_upscale:
+                config_params["upsampling"] = True
             if duration_seconds:
                 dur = int(duration_seconds)
                 if not Config.MIN_DURATION_S <= dur <= Config.MAX_DURATION_S:
@@ -487,20 +687,18 @@ class GenAIService:
                 refs = []
                 # Official limits: max 3 ASSET and max 3 STYLE references.
                 asset_left, style_left = 3, 3
-                for p in reference_image_paths:
-                    kind = "STYLE" if "style:" in p.lower() else "ASSET"
+                for spec in reference_image_paths:
+                    path, kind = self.parse_reference_spec(spec)
                     if kind == "STYLE":
                         if style_left == 0:
-                            logger.warning("Ignoring extra STYLE reference (max 3): %s", p)
+                            logger.warning("Ignoring extra STYLE reference (max 3): %s", path)
                             continue
                         style_left -= 1
-                        path = p.split("style:", 1)[1].strip() if "style:" in p.lower() else p
                     else:
                         if asset_left == 0:
-                            logger.warning("Ignoring extra ASSET reference (max 3): %s", p)
+                            logger.warning("Ignoring extra ASSET reference (max 3): %s", path)
                             continue
                         asset_left -= 1
-                        path = p
                     img_obj = self._get_image_param(path)
                     if img_obj:
                         refs.append(types.VideoGenerationReferenceImage(image=img_obj, reference_type=kind))
@@ -540,20 +738,32 @@ class GenAIService:
                     raise
 
             logger.info("Waiting for generation to finish...")
-            self._await_operation(operation)
+            self._await_operation(operation, progress_cb=progress_cb)
 
             generated_video = operation.response.generated_videos[0]
             self.client.files.download(file=generated_video.video)
             generated_video.video.save(output_filename)
             logger.info("Video saved: %s", output_filename)
+            self._journal.record("video", "ok", prompt=prompt, output=output_filename,
+                                 duration_s=time.time() - start,
+                                 extra={"resolution": resolution, "upscaled": bool(use_upscale)})
             return output_filename
+        except CancelledError:
+            logger.warning("Video generation cancelled by user.")
+            self._journal.record("video", "failed", prompt=prompt, error="cancelled",
+                                 duration_s=time.time() - start)
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error("Video generation failed: %s", e)
+            self._journal.record("video", "failed", prompt=prompt, error=str(e),
+                                 duration_s=time.time() - start)
             return None
 
     def generate_image(self, prompt: str, output_filename: str) -> Optional[str]:
         logger.info("Generating image: '%s'", prompt)
         FileManager.record_prompt(prompt, "image", output_filename)
+        self._check_cancelled()
+        start = time.time()
         try:
             response = self.client.models.generate_content(
                 model=Config.MODEL_IMAGE,
@@ -565,11 +775,18 @@ class GenAIService:
                     image = part.as_image()
                     image.save(output_filename)
                     logger.info("Image saved: %s", output_filename)
+                    self._journal.record("image", "ok", prompt=prompt, output=output_filename,
+                                         duration_s=time.time() - start)
                     return output_filename
             logger.error("No image returned in response parts.")
+            self._journal.record("image", "failed", prompt=prompt, error="No image in response")
             return None
+        except CancelledError:
+            self._journal.record("image", "failed", prompt=prompt, error="cancelled")
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error("Image generation failed: %s", e)
+            self._journal.record("image", "failed", prompt=prompt, error=str(e))
             return None
 
     def generate_audio(
@@ -592,6 +809,8 @@ class GenAIService:
 
         logger.info("Generating music: '%s' (%d sec)...", prompt, duration_seconds)
         FileManager.record_prompt(prompt, "audio", output_filename)
+        self._check_cancelled()
+        start = time.time()
 
         async def run_audio_session():
             client_lyria = genai.Client(
@@ -617,6 +836,8 @@ class GenAIService:
                     logger.info("Recording audio stream...")
                     start_time = time.time()
                     async for message in session.receive():
+                        if self.cancel_event.is_set():
+                            raise CancelledError("Cancelled by user")
                         sc = getattr(message, "server_content", None)
                         setup = getattr(sc, "setup", None) if sc else None
                         if setup is not None:
@@ -631,6 +852,8 @@ class GenAIService:
                             break
                     logger.info("Audio generation finished.")
                     return bytes(audio_buffer), framerate, channels, sample_width
+            except CancelledError:
+                raise
             except Exception as e:  # noqa: BLE001
                 err = str(e)
                 if "PERMISSION_DENIED" in err or "403" in err:
@@ -652,10 +875,20 @@ class GenAIService:
                     wf.setframerate(framerate)
                     wf.writeframes(audio_data)
                 logger.info("Audio saved: %s", output_filename)
+                self._journal.record("audio", "ok", prompt=prompt, output=output_filename,
+                                     duration_s=time.time() - start)
                 return output_filename
+            self._journal.record("audio", "failed", prompt=prompt, error="session returned no audio",
+                                 duration_s=time.time() - start)
             return None
+        except CancelledError:
+            self._journal.record("audio", "failed", prompt=prompt, error="cancelled",
+                                 duration_s=time.time() - start)
+            raise
         except Exception as e:  # noqa: BLE001
             logger.error("Audio generation launch failed: %s", e)
+            self._journal.record("audio", "failed", prompt=prompt, error=str(e),
+                                 duration_s=time.time() - start)
             return None
 
 
@@ -668,11 +901,31 @@ class GenerationOrchestrator:
     All progress reporting goes through the injected ``log_fn`` callback so the
     CLI can print to stdout while the GUI routes messages to its console widget
     without monkey-patching ``sys.stdout`` (item 2).
+
+    ``progress_cb(percent|None, stage)`` is an optional second channel used by
+    GUI progress bars; it never raises into the workflow.
     """
 
-    def __init__(self, ai: Optional[GenAIService] = None, log_fn: Optional[Callable[[str], None]] = None):
+    def __init__(
+        self,
+        ai: Optional[GenAIService] = None,
+        log_fn: Optional[Callable[[str], None]] = None,
+        progress_cb: Optional[Callable[[Optional[int], str], None]] = None,
+    ):
         self.ai = ai or GenAIService()
         self.log = log_fn or (lambda msg: print(msg, flush=True))
+        self._progress_cb = progress_cb
+
+    def _report_progress(self, pct: Optional[int], stage: str = "") -> None:
+        if self._progress_cb is not None:
+            try:
+                self._progress_cb(pct, stage)
+            except Exception:  # noqa: BLE001 - UI callbacks must not break work
+                pass
+
+    def cancel(self) -> None:
+        """Request cancellation of any in-flight orchestrator workflow."""
+        self.ai.cancel()
 
     # ---------- single ----------
 
@@ -691,56 +944,101 @@ class GenerationOrchestrator:
         image_path: Optional[str] = None,
         last_frame_path: Optional[str] = None,
         reference_image_paths: Optional[list[str]] = None,
+        generate_audio: bool = True,
+        upsampling: Optional[bool] = None,
     ) -> Optional[str]:
-        if expand:
-            expanded = self.ai.expand_prompt(prompt)
-            if expanded:
-                self.log(f"Expanded prompt: {expanded}")
-                prompt = expanded
-        if template:
-            prompt = FileManager.apply_template(template, prompt)
+        self.ai.reset_cancel()
+        start = time.time()
+        status = "failed"
+        out: Optional[str] = None
+        try:
+            if expand:
+                self._report_progress(0, "expanding prompt")
+                expanded = self.ai.expand_prompt(prompt)
+                if expanded:
+                    self.log(f"Expanded prompt: {expanded}")
+                    prompt = expanded
+            if template:
+                prompt = FileManager.apply_template(template, prompt)
 
-        use_auto = Config.GENERATE_NEGATIVE_PROMPT if auto_negative is None else auto_negative
-        if not negative_prompt and use_auto:
-            self.log("Auto-generating negative prompt...")
-            negative_prompt = self.ai.generate_negative_prompt(prompt)
-            if negative_prompt:
-                self.log(f"Negative prompt: {negative_prompt}")
+            use_auto = Config.GENERATE_NEGATIVE_PROMPT if auto_negative is None else auto_negative
+            if not negative_prompt and use_auto:
+                self._report_progress(0, "negative prompt")
+                self.log("Auto-generating negative prompt...")
+                negative_prompt = self.ai.generate_negative_prompt(prompt)
+                if negative_prompt:
+                    self.log(f"Negative prompt: {negative_prompt}")
 
-        if output_filename is None:
-            output_filename = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "veo_video", ".mp4")
+            if output_filename is None:
+                output_filename = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "veo_video", ".mp4")
 
-        return self.ai.generate_video(
-            prompt,
-            output_filename,
-            image_path=image_path,
-            last_frame_path=last_frame_path,
-            aspect_ratio=aspect_ratio,
-            resolution=resolution,
-            duration_seconds=duration_seconds,
-            negative_prompt=negative_prompt,
-            reference_image_paths=reference_image_paths,
-        )
+            self._report_progress(5, "submitting")
+            out = self.ai.generate_video(
+                prompt,
+                output_filename,
+                image_path=image_path,
+                last_frame_path=last_frame_path,
+                aspect_ratio=aspect_ratio,
+                resolution=resolution,
+                duration_seconds=duration_seconds,
+                generate_audio=generate_audio,
+                negative_prompt=negative_prompt,
+                reference_image_paths=reference_image_paths,
+                upsampling=upsampling,
+                progress_cb=lambda pct: self._report_progress(
+                    (10 + pct * 88 // 100) if pct is not None else None, "generating"
+                ),
+            )
+            status = "ok" if out else "failed"
+            return out
+        finally:
+            self._report_progress(100 if out else None, "done" if out else "stopped")
+            self.ai._journal.record("task_video", status, prompt=prompt, output=out,
+                                    duration_s=time.time() - start)
 
     # ---------- batch (concurrent, item 10) ----------
 
-    def batch_generate(self, prompts: list[str], resolution: str = "720p", max_workers: Optional[int] = None) -> list[Optional[str]]:
+    def batch_generate(
+        self,
+        prompts: list[str],
+        resolution: str = "720p",
+        max_workers: Optional[int] = None,
+        generate_audio: bool = True,
+        upsampling: Optional[bool] = None,
+    ) -> list[Optional[str]]:
+        self.ai.reset_cancel()
+        start = time.time()
         results: list[Optional[str]] = [None] * len(prompts)
         workers = max_workers or Config.BATCH_WORKERS
+        done_count = {"n": 0}
 
         def job(idx_prompt: tuple[int, str]) -> None:
             idx, p = idx_prompt
+            if self.ai.cancel_event.is_set():
+                self.log(f"Batch item {idx + 1} skipped (cancelled).")
+                return
             fname = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], f"batch_{idx + 1}", ".mp4")
             try:
-                results[idx] = self.ai.generate_video(p, fname, resolution=resolution)
+                results[idx] = self.ai.generate_video(
+                    p, fname, resolution=resolution,
+                    generate_audio=generate_audio, upsampling=upsampling,
+                )
+            except CancelledError:
+                self.log(f"Batch item {idx + 1} cancelled.")
             except Exception as e:  # noqa: BLE001
                 self.log(f"Batch item {idx + 1} failed: {e}")
+            finally:
+                done_count["n"] += 1
+                self._report_progress(100 * done_count["n"] // len(prompts), f"batch {done_count['n']}/{len(prompts)}")
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             list(pool.map(job, list(enumerate(prompts))))
 
         ok = sum(1 for r in results if r)
         self.log(f"Batch finished: {ok}/{len(prompts)} succeeded.")
+        self.ai._journal.record("batch", "ok" if ok == len(prompts) else "failed",
+                                prompt=f"{len(prompts)} prompts", duration_s=time.time() - start,
+                                extra={"succeeded": ok, "total": len(prompts)})
         return results
 
     # ---------- chain (with resume, item 15) ----------
@@ -753,40 +1051,64 @@ class GenerationOrchestrator:
         resolution: str = "720p",
         start_image: Optional[str] = None,
         final_name: Optional[str] = None,
+        generate_audio: bool = True,
+        upsampling: Optional[bool] = None,
     ) -> Optional[str]:
         """Generate a chain where each segment starts from the previous last frame.
 
         State is persisted after every successful link so an interrupted chain
-        can be resumed with :meth:`resume_chain`.
+        can be resumed with :meth:`resume_chain`.  Works for N clips (any
+        number of prompts); cancellation stops cleanly and keeps resume state.
         """
         if not prompts:
             self.log("Chain requires at least one prompt.")
             return None
 
+        self.ai.reset_cancel()
+        start = time.time()
         video_chain: list[str] = []
         temp_files: list[str] = []
         remaining = list(prompts)
+        total = len(prompts)
 
         first_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "chain_segment_1", ".mp4")
-        kwargs = dict(aspect_ratio=aspect_ratio, resolution=resolution)
+        kwargs = dict(aspect_ratio=aspect_ratio, resolution=resolution, generate_audio=generate_audio,
+                      upsampling=upsampling)
         v = self.ai.generate_video(remaining.pop(0), first_name, image_path=start_image, **kwargs)
         if not v:
             self.log("First chain segment failed.")
+            self.ai._journal.record("chain", "failed", prompt=f"1/{total}", duration_s=time.time() - start)
             return None
         video_chain.append(v)
         temp_files.append(v)
+        self._report_progress(int(100 * len(video_chain) / total), f"segment {len(video_chain)}/{total}")
         FileManager.save_resume_state({"prompts": remaining, "chain": video_chain, "temp_files": temp_files,
                                        "aspect_ratio": aspect_ratio, "resolution": resolution})
 
+        cancelled = False
         for i, p in enumerate(remaining):
+            if self.ai.cancel_event.is_set():
+                cancelled = True
+                self.log("Chain cancelled; state saved for resume.")
+                remaining = remaining[i:]
+                FileManager.save_resume_state({"prompts": remaining, "chain": video_chain,
+                                               "temp_files": temp_files, **kwargs})
+                break
             last_frame_path = FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], f"temp_frame_{i}", ".png")
             if not MediaProcessor.extract_frame(video_chain[-1], last_frame_path, "last"):
                 self.log("Frame extraction failed; stopping chain (state saved for resume).")
-                return None
+                remaining = remaining[i:]
+                FileManager.save_resume_state({"prompts": remaining, "chain": video_chain,
+                                               "temp_files": temp_files, **kwargs})
+                break
             temp_files.append(last_frame_path)
             next_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], f"chain_segment_{i + 2}", ".mp4")
-            v_next = self.ai.generate_video(p or "Continue the action, high quality", next_name,
-                                            image_path=last_frame_path, **kwargs)
+            try:
+                v_next = self.ai.generate_video(p or "Continue the action, high quality", next_name,
+                                                image_path=last_frame_path, **kwargs)
+            except CancelledError:
+                cancelled = True
+                v_next = None
             if not v_next:
                 self.log(f"Segment {i + 2} failed; partial chain kept (state saved for resume).")
                 remaining = remaining[i:]
@@ -795,11 +1117,16 @@ class GenerationOrchestrator:
                 break
             video_chain.append(v_next)
             temp_files.append(v_next)
+            self._report_progress(int(100 * len(video_chain) / total), f"segment {len(video_chain)}/{total}")
             FileManager.save_resume_state({"prompts": [], "chain": video_chain, "temp_files": temp_files, **kwargs})
 
-        stitched = self._finalize_chain(video_chain, temp_files, final_name)
+        stitched = None if cancelled else self._finalize_chain(video_chain, temp_files, final_name)
         if stitched:
             FileManager.clear_resume_state()
+        self.ai._journal.record("chain", "ok" if stitched else "failed",
+                                prompt=f"{total} segments", output=stitched,
+                                duration_s=time.time() - start,
+                                extra={"segments_done": len(video_chain)})
         return stitched
 
     def resume_chain(self, final_name: Optional[str] = None) -> Optional[str]:
@@ -857,6 +1184,8 @@ class GenerationOrchestrator:
         *,
         aspect_ratio: str = "16:9",
         resolution: str = "720p",
+        generate_audio: bool = True,
+        upsampling: Optional[bool] = None,
     ) -> Optional[dict]:
         """Extract frames and generate the bridge clip between two videos.
 
@@ -867,6 +1196,7 @@ class GenerationOrchestrator:
             self.log("Error: Video 1 not found.")
             return None
 
+        self.ai.reset_cancel()
         state: dict = {
             "p1": v1_path,
             "bridge": None,
@@ -876,6 +1206,8 @@ class GenerationOrchestrator:
             "temp_files": [],
             "aspect_ratio": aspect_ratio,
             "resolution": resolution,
+            "generate_audio": generate_audio,
+            "upsampling": upsampling,
         }
 
         if v2_path_or_none and os.path.exists(v2_path_or_none):
@@ -886,8 +1218,10 @@ class GenerationOrchestrator:
                 self.log("Error: provide Video 2 path OR prompt.")
                 return None
             self.log("Generating initial Video 2...")
+            self._report_progress(10, "video 2")
             v2_file = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "bridge_v2", ".mp4")
-            v = self.ai.generate_video(v2_prompt, v2_file, aspect_ratio=aspect_ratio, resolution=resolution)
+            v = self.ai.generate_video(v2_prompt, v2_file, aspect_ratio=aspect_ratio, resolution=resolution,
+                                       generate_audio=generate_audio, upsampling=upsampling)
             if not v:
                 return None
             state["v2_type"] = "generated"
