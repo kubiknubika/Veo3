@@ -224,22 +224,65 @@ class VeoGUIApp:
             spacing=4,
         )
 
-        # Tabs
-        self.tabs = ft.Tabs(
-            selected_index=0, animation_duration=200, expand=True,
-            tabs=[
-                ft.Tab(text="Single Gen", content=self._build_single_tab()),
-                ft.Tab(text="Bridge / Interpolation", content=self._build_bridge_tab()),
-                ft.Tab(text="Batch & Chain", content=self._build_batch_tab()),
-                ft.Tab(text="Image & Audio", content=self._build_utils_tab()),
-                ft.Tab(text="Tasks", content=self._build_journal_tab()),
+        # Tab strip: SegmentedButton selector + Stack of tab panels.
+        # (ft.Tabs exists in Flet 1.x too, but the Material-3 segmented
+        # control is the recommended replacement and keeps all panels
+        # mounted — no state loss when switching.)
+        self._tab_order = ["single", "bridge", "batch", "utils", "journal"]
+        self._tab_titles = {
+            "single": "Single Gen",
+            "bridge": "Bridge / Interpolation",
+            "batch": "Batch & Chain",
+            "utils": "Image & Audio",
+            "journal": "Tasks",
+        }
+        self._tab_panels: dict[str, ft.Control] = {
+            "single": self._build_single_tab(),
+            "bridge": self._build_bridge_tab(),
+            "batch": self._build_batch_tab(),
+            "utils": self._build_utils_tab(),
+            "journal": self._build_journal_tab(),
+        }
+        self.tab_bar = ft.SegmentedButton(
+            allow_multiple_selection=False,
+            show_selected_icon=False,
+            selected=["single"],
+            segments=[
+                ft.Segment(value=key, label=ft.Text(self._tab_titles[key]))
+                for key in self._tab_order
             ],
+            on_change=self._on_tab_change,
         )
+        # Keep every panel mounted; toggle visibility on selection.
+        self._panel_containers = {
+            key: ft.Container(self._tab_panels[key],
+                              visible=(key == "single"), padding=4)
+            for key in self._tab_order
+        }
+        self.tab_stack = ft.Stack(controls=list(self._panel_containers.values()),
+                                  expand=True)
 
         self.root_view = ft.Column(
-            [self.tabs, console_col, ft.Divider(), status_row],
+            [self.tab_bar, self.tab_stack, console_col, ft.Divider(), status_row],
             expand=True, spacing=10,
         )
+
+    def _switch_tab(self, key: str) -> None:
+        """Show one tab panel, hide the rest (all stay mounted)."""
+        for k, cont in self._panel_containers.items():
+            cont.visible = (k == key)
+        if key not in self.tab_bar.selected:
+            self.tab_bar.selected = [key]
+        try:
+            self.tab_bar.update()
+            self.tab_stack.update()
+        except Exception:  # noqa: BLE001 - page may be closing
+            pass
+
+    def _on_tab_change(self, e: ft.ControlEvent) -> None:
+        sel = e.control.selected
+        if sel:
+            self._switch_tab(sel[0])
 
     # ----- Single tab ---------------------------------------------------- #
 
@@ -488,8 +531,7 @@ class VeoGUIApp:
             return
         self.single_prompt.value = str(rows[-1].get("prompt", ""))
         self.single_prompt.update()
-        self.tabs.selected_index = 0
-        self.tabs.update()
+        self._switch_tab("single")
 
     # ------------------------------------------------------------------ #
     # Helpers

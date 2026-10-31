@@ -1780,10 +1780,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         validate_api_key()
     except ApiKeyError as e:
+        # 'tasks' is read-only reporting from the local journal — it must
+        # work even without an API key configured.
+        if args.command == "tasks":
+            return VeoGeneratorApp.show_tasks(limit=args.limit, as_json=args.json)
         print(f"Configuration error: {e}", file=sys.stderr)
         return 2
 
-    # 'tasks' is a read-only reporting command: no orchestrator / API calls needed.
     if args.command == "tasks":
         return VeoGeneratorApp.show_tasks(limit=args.limit, as_json=args.json)
 

@@ -1,5 +1,4 @@
 google-genai
 pillow
 python-dotenv
-opencv-python
-moviepy
+flet
