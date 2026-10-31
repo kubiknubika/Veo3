@@ -8,14 +8,16 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import MagicMock, patch, mock_open, ANY
 
 from google.genai import types
 
 import veo_generator
 from veo_generator import (
     ApiKeyError,
+    CancelledError,
     Config,
     FileManager,
     GenerationOrchestrator,
@@ -23,6 +25,16 @@ from veo_generator import (
     MediaProcessor,
     validate_api_key,
 )
+from task_journal import TaskJournal
+
+
+def _fake_journal() -> MagicMock:
+    """MagicMock standing in for GenAIService._journal in orchestrator tests."""
+    j = MagicMock(spec=TaskJournal)
+    j.record = MagicMock()
+    j.load = MagicMock(return_value=[])
+    j.stats = MagicMock(return_value={})
+    return j
 
 
 class TestApiKeyValidation(unittest.TestCase):
@@ -108,6 +120,31 @@ class TestFileManager(unittest.TestCase):
             FileManager.clear_resume_state()
             self.assertIsNone(FileManager.load_resume_state())
 
+    def test_resume_state_write_is_atomic_and_locked(self):
+        """Concurrent saves must never leave a torn/corrupt JSON file."""
+        rf = os.path.join(self.test_dir, "resume.json")
+        with patch.object(Config, "RESUME_FILE", rf):
+            errors: list[Exception] = []
+
+            def writer(i: int) -> None:
+                try:
+                    for _ in range(20):
+                        FileManager.save_resume_state({"prompts": [f"p{i}"] * 50})
+                except Exception as e:  # noqa: BLE001
+                    errors.append(e)
+
+            threads = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])
+            # File always parses and no temp files are left behind
+            state = FileManager.load_resume_state()
+            self.assertIsInstance(state, dict)
+            leftovers = [f for f in os.listdir(self.test_dir) if f.startswith(".resume_")]
+            self.assertEqual(leftovers, [])
+
 
 class TestMediaProcessor(unittest.TestCase):
     @patch("cv2.imwrite", return_value=True)
@@ -155,11 +192,14 @@ class TestMediaProcessor(unittest.TestCase):
 
     @patch("veo_generator.VideoFileClip")
     @patch("veo_generator.concatenate_videoclips")
-    def test_concatenate_videos_success_closes_clips(self, mock_concat, mock_videoclip):
+    @patch.object(MediaProcessor, "_probe_video")
+    def test_concatenate_videos_success_closes_clips(self, mock_probe, mock_concat, mock_videoclip):
         clip = MagicMock()
         mock_videoclip.return_value = clip
         final = MagicMock()
         mock_concat.return_value = final
+        meta = {"w": 1280, "h": 720, "fps": 24.0}
+        mock_probe.side_effect = [meta, dict(meta)]   # identical geometry -> no re-encode
 
         result = MediaProcessor.concatenate_videos(["v1.mp4", "v2.mp4"], "final.mp4")
 
@@ -171,11 +211,31 @@ class TestMediaProcessor(unittest.TestCase):
 
     @patch("veo_generator.VideoFileClip")
     @patch("veo_generator.concatenate_videoclips")
-    def test_concatenate_videos_error_still_releases_handles(self, mock_concat, mock_videoclip):
+    @patch.object(MediaProcessor, "_probe_video")
+    def test_concatenate_videos_normalizes_mismatched_clips(self, mock_probe, mock_concat, mock_videoclip):
+        """New clips with different geometry must be re-encoded to the first clip's size."""
+        mock_videoclip.return_value = MagicMock()
+        mock_concat.return_value = MagicMock()
+        mock_probe.side_effect = [{"w": 1920, "h": 1080, "fps": 24.0},
+                                  {"w": 1280, "h": 720, "fps": 30.0}]
+        with patch.object(MediaProcessor, "normalize_clip",
+                          return_value="norm.mp4") as mock_norm:
+            result = MediaProcessor.concatenate_videos(["a.mp4", "b.mp4"], "out.mp4")
+        self.assertEqual(result, "out.mp4")
+        mock_norm.assert_called_once_with("b.mp4", 1920, 1080, ANY)
+        # second clip opened from the normalized file
+        self.assertEqual(mock_videoclip.call_args_list[1][0][0], "norm.mp4")
+
+    @patch("veo_generator.VideoFileClip")
+    @patch("veo_generator.concatenate_videoclips")
+    @patch.object(MediaProcessor, "_probe_video")
+    def test_concatenate_videos_error_still_releases_handles(self, mock_probe, mock_concat, mock_videoclip):
         """Regression test for the file-descriptor leak on concat failure."""
         clips = [MagicMock() for _ in range(2)]
         mock_videoclip.side_effect = clips
         mock_concat.side_effect = RuntimeError("boom")
+        meta = {"w": 1280, "h": 720, "fps": 24.0}
+        mock_probe.side_effect = [meta, dict(meta)]
 
         result = MediaProcessor.concatenate_videos(["a.mp4", "b.mp4"], "out.mp4")
 
@@ -298,6 +358,7 @@ class TestGenAIService(unittest.TestCase):
 class TestOrchestrator(unittest.TestCase):
     def setUp(self):
         self.ai = MagicMock(spec=GenAIService)
+        self.ai._journal = _fake_journal()
         self.logs = []
         self.orch = GenerationOrchestrator(ai=self.ai, log_fn=self.logs.append)
 
@@ -406,6 +467,8 @@ class TestOrchestrator(unittest.TestCase):
             self.assertEqual(out, dest)
             self.assertTrue(os.path.exists(dest))
             self.assertFalse(os.path.exists(prev))
+            # journal records the accepted bridge (reliability item)
+            self.ai._journal.record.assert_any_call("bridge", "ok", output=dest, duration_s=ANY)
 
 
 class TestCLI(unittest.TestCase):

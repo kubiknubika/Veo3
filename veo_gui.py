@@ -154,7 +154,18 @@ class VeoGUIApp:
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Output Console (Bottom)
+        # Status bar (bottom): progress bar + Cancel button (items: progress/cancel)
+        status_frame = ttk.Frame(main_frame)
+        status_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(5, 0))
+        self.btn_cancel = ttk.Button(status_frame, text="Cancel", command=self._cancel_current,
+                                     state="disabled", width=10)
+        self.btn_cancel.pack(side=tk.RIGHT, padx=5)
+        self.progress_bar = ttk.Progressbar(status_frame, mode="determinate", length=320)
+        self.progress_bar.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.progress_label = ttk.Label(status_frame, text="Idle", width=24)
+        self.progress_label.pack(side=tk.LEFT, padx=5)
+
+        # Output Console (above the status bar)
         console_frame = ttk.LabelFrame(main_frame, text="Log Output", height=200)
         console_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=5)
 
@@ -173,12 +184,20 @@ class VeoGUIApp:
         self.notebook.add(self.tab_bridge, text="Bridge / Interpolation")
         self._setup_bridge_tab()
 
+        self.tab_batch = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_batch, text="Batch & Chain")
+        self._setup_batch_tab()
+
         self.tab_utils = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_utils, text="Image & Audio")
         self._setup_utils_tab()
 
+        self.tab_journal = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_journal, text="Tasks")
+        self._setup_journal_tab()
+
     def _options_row(self, parent: ttk.Frame, row: int) -> None:
-        """Shared resolution/aspect controls bound to app-level StringVars."""
+        """Shared generation options bound to app-level Vars, used on every tab."""
         # 4k is only offered for the preview model (official Veo 3.1 docs).
         res_values = ["720p", "1080p"] + (["4k"] if "preview" in Config.MODEL_VIDEO else [])
         if self.res_var.get() not in res_values:
@@ -189,6 +208,8 @@ class VeoGUIApp:
         ttk.Label(parent, text="Aspect Ratio:").grid(row=row, column=2, padx=5, sticky=tk.W)
         ttk.Combobox(parent, textvariable=self.ar_var, values=["16:9", "9:16"],
                      state="readonly", width=8).grid(row=row, column=3, padx=5)
+        ttk.Checkbutton(parent, text="Audio", variable=self.audio_var).grid(row=row, column=4, padx=5)
+        ttk.Checkbutton(parent, text="Upscale 1080p", variable=self.upscale_var).grid(row=row, column=5, padx=5)
 
     def _setup_single_tab(self) -> None:
         frame = ttk.Frame(self.tab_single, padding=20)
@@ -218,11 +239,62 @@ class VeoGUIApp:
         self.auto_neg_chk.pack(anchor=tk.W)
 
         btn_frame = ttk.Frame(frame)
-        btn_frame.pack(fill=tk.X, pady=20)
+        btn_frame.pack(fill=tk.X, pady=10)
         ttk.Button(btn_frame, text="Generate Video", command=self._run_single_gen).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="Open Last Result", command=lambda: self._open_last(self._last_video)).pack(side=tk.LEFT, padx=5)
 
+        # Result preview (thumbnail of the first frame — item: in-GUI preview)
+        prev_frame = ttk.LabelFrame(frame, text="Result Preview", padding=5)
+        prev_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        self.thumb_label = ttk.Label(prev_frame, text="No result yet", anchor=tk.CENTER)
+        self.thumb_label.pack(fill=tk.BOTH, expand=True)
+
         self._last_video: Optional[str] = None
+
+    def _setup_batch_tab(self) -> None:
+        """Batch / Chain tab — exposes orchestrator flows that were CLI-only."""
+        frame = ttk.Frame(self.tab_batch, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frame, text="Prompts (one per line):").pack(anchor=tk.W)
+        self.batch_text = tk.Text(frame, height=8, width=70)
+        self.batch_text.pack(fill=tk.X, pady=5)
+
+        bopts = ttk.Frame(frame)
+        bopts.pack(fill=tk.X, pady=5)
+        self._options_row(bopts, 0)
+        ttk.Label(bopts, text="Workers:").grid(row=1, column=0, padx=5, sticky=tk.W)
+        self.workers_var = tk.StringVar(value="")
+        ttk.Entry(bopts, textvariable=self.workers_var, width=6).grid(row=1, column=1, padx=5, sticky=tk.W)
+
+        ttk.Label(frame, text="Start image for chain (optional):").pack(anchor=tk.W, pady=(5, 0))
+        img_frame = ttk.Frame(frame)
+        img_frame.pack(fill=tk.X)
+        self.chain_img_var = tk.StringVar()
+        ttk.Entry(img_frame, textvariable=self.chain_img_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        ttk.Button(img_frame, text="Browse", command=lambda: self._browse_image(self.chain_img_var)).pack(side=tk.LEFT)
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X, pady=10)
+        ttk.Button(btns, text="Run Batch (parallel)", command=self._run_batch).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Run Chain (frame-linked)", command=self._run_chain).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btns, text="Resume Chain", command=self._resume_chain).pack(side=tk.LEFT, padx=5)
+
+    def _setup_journal_tab(self) -> None:
+        """Tasks tab — JSONL journal statistics and recent runs."""
+        frame = ttk.Frame(self.tab_journal, padding=20)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        top = ttk.Frame(frame)
+        top.pack(fill=tk.X)
+        ttk.Button(top, text="Refresh", command=self._refresh_journal).pack(side=tk.LEFT)
+
+        self.journal_stats = tk.Text(frame, height=4, state="disabled")
+        self.journal_stats.pack(fill=tk.X, pady=5)
+
+        self.journal_list = tk.Listbox(frame, height=18)
+        self.journal_list.pack(fill=tk.BOTH, expand=True, pady=5)
+        self._refresh_journal()
 
     def _setup_utils_tab(self) -> None:
         frame = ttk.Frame(self.tab_utils, padding=20)
@@ -333,12 +405,66 @@ class VeoGUIApp:
         if f:
             var.set(f)
 
+    def _browse_image(self, var: tk.StringVar) -> None:
+        f = filedialog.askopenfilename(filetypes=[("Images", "*.png *.jpg *.jpeg *.webp")])
+        if f:
+            var.set(f)
+
+    def _show_thumbnail(self, video_path: str) -> None:
+        """Render a first-frame preview of the result inside the GUI."""
+        try:
+            thumb_dir = os.path.dirname(Config.TASKS_JOURNAL_FILE)
+            thumb = MediaProcessor.extract_thumbnail(
+                video_path, os.path.join(thumb_dir, "gui_preview.png"))
+            if not thumb:
+                return
+
+            def apply() -> None:
+                try:
+                    self._thumb_photo = tk.PhotoImage(file=thumb)
+                    self.thumb_label.configure(image=self._thumb_photo, text="")
+                except tk.TclError as e:  # e.g. unsupported PNG variant
+                    self._enqueue_log(f"Thumbnail preview unavailable: {e}")
+
+            self._ui(apply)
+        except Exception as e:  # noqa: BLE001 - preview is strictly best-effort
+            self._enqueue_log(f"Thumbnail preview failed: {e}")
+
+    def _refresh_journal(self) -> None:
+        """Reload the Tasks tab from the JSONL journal (instance journal path)."""
+        journal = self.ai._journal
+        entries = journal.load(limit=50)
+        stats = journal.stats()
+        self.journal_list.delete(0, tk.END)
+        for rec in reversed(entries):
+            err = f" — {rec.get('error')}" if rec.get("error") else ""
+            dur = f" {rec.get('duration_s', 0):.0f}s" if rec.get("duration_s") else ""
+            self.journal_list.insert(
+                tk.END,
+                f"[{rec.get('ts', '')}] {rec.get('kind', '?'):12s} {rec.get('status', '?'):7s}"
+                f"{dur}{err} :: {str(rec.get('prompt', ''))[:50]}")
+        self.journal_stats.configure(state="normal")
+        self.journal_stats.delete("1.0", tk.END)
+        by_kind = stats.get("by_kind", {})
+        lines = [f"{k}: {v.get('ok', 0)} ok / {v.get('failed', 0)} failed"
+                 for k, v in sorted(by_kind.items())]
+        lines.insert(0, f"total={stats.get('total', 0)}  ok={stats.get('ok', 0)}  "
+                        f"failed={stats.get('failed', 0)}  "
+                        f"avg={stats.get('avg_duration_s', 0.0):.1f}s")
+        self.journal_stats.insert("1.0", "\n".join(lines))
+        self.journal_stats.configure(state="disabled")
+
     def _run_in_thread(self, target: Callable[[], None]) -> None:
         def wrapper() -> None:
+            self.ai.reset_cancel()
+            self._ui(lambda: self._set_busy(True))
             try:
                 target()
             except Exception as e:  # noqa: BLE001 - never let a worker die silently
                 self._enqueue_log(f"Unexpected error in worker thread: {e}")
+            finally:
+                self._ui(lambda: self._set_busy(False))
+
         threading.Thread(target=wrapper, daemon=True).start()
 
     def _open_last(self, path: Optional[str]) -> None:
@@ -402,12 +528,83 @@ class VeoGUIApp:
             self._enqueue_log("Starting Video Generation...")
             out = self.orch.single_video(prompt, aspect_ratio=ar, resolution=res,
                                          negative_prompt=neg, auto_negative=auto_neg,
-                                         expand=expand, duration_seconds=duration)
+                                         expand=expand, duration_seconds=duration,
+                                         generate_audio=self.audio_var.get(),
+                                         upsampling=self.upscale_var.get())
             if out:
                 self._last_video = out
                 self._enqueue_log(f"Done! Saved: {out}")
+                self._show_thumbnail(out)
             else:
-                self._enqueue_log("Generation failed. See log above.")
+                self._enqueue_log("Generation failed or cancelled. See log above.")
+
+        self._run_in_thread(task)
+
+    # ---------- Batch / Chain tab ----------
+
+    def _collect_batch_prompts(self) -> list[str]:
+        return [ln.strip() for ln in self.batch_text.get("1.0", tk.END).splitlines()
+                if ln.strip() and not ln.strip().startswith("#")]
+
+    def _parse_workers(self) -> Optional[int]:
+        raw = self.workers_var.get().strip()
+        return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
+    def _run_batch(self) -> None:
+        prompts = self._collect_batch_prompts()
+        if not prompts:
+            messagebox.showinfo("Batch", "Enter at least one prompt (one per line).")
+            return
+
+        def task() -> None:
+            self._enqueue_log(f"Batch: {len(prompts)} prompt(s)...")
+            results = self.orch.batch_generate(
+                prompts, resolution=self.res_var.get(), max_workers=self._parse_workers(),
+                generate_audio=self.audio_var.get(), upsampling=self.upscale_var.get())
+            ok = sum(1 for r in results if r)
+            self._enqueue_log(f"Batch finished: {ok}/{len(prompts)} succeeded.")
+            if ok:
+                self._last_video = next(r for r in results if r)
+                self._ui(lambda: self._refresh_journal())
+
+        self._run_in_thread(task)
+
+    def _run_chain(self) -> None:
+        prompts = self._collect_batch_prompts()
+        if len(prompts) < 2:
+            messagebox.showinfo("Chain", "A chain needs at least two prompts (one per line).")
+            return
+        start_img = self.chain_img_var.get().strip() or None
+
+        def task() -> None:
+            self._enqueue_log(f"Chain: {len(prompts)} segment(s)...")
+            out = self.orch.run_chain(
+                prompts, aspect_ratio=self.ar_var.get(), resolution=self.res_var.get(),
+                start_image=start_img,
+                generate_audio=self.audio_var.get(), upsampling=self.upscale_var.get())
+            if out:
+                self._last_video = out
+                self._enqueue_log(f"Chain saved: {out}")
+                self._show_thumbnail(out)
+            else:
+                self._enqueue_log("Chain stopped/failed — use 'Resume Chain' to continue.")
+            self._ui(lambda: self._refresh_journal())
+
+        self._run_in_thread(task)
+
+    def _resume_chain(self) -> None:
+        state = FileManager.load_resume_state()
+        if not state:
+            messagebox.showinfo("Chain", "No resumable chain state found.")
+            return
+
+        def task() -> None:
+            out = self.orch.resume_chain()
+            if out:
+                self._last_video = out
+                self._enqueue_log(f"Resumed chain saved: {out}")
+                self._show_thumbnail(out)
+            self._ui(lambda: self._refresh_journal())
 
         self._run_in_thread(task)
 
@@ -479,6 +676,7 @@ class VeoGUIApp:
         state = self.orch.bridge_step1_prepare(
             v1, v2_existing, v2_prompt, bridge_prompt,
             aspect_ratio=self.ar_var.get(), resolution=self.res_var.get(),
+            generate_audio=self.audio_var.get(), upsampling=self.upscale_var.get(),
         )
         if not state:
             self._ui(lambda: self.btn_start_bridge.configure(state="normal"))
