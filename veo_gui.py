@@ -26,10 +26,16 @@ from veo_generator import (
     ApiKeyError,
     Config,
     FileManager,
+    GenerationError,
     GenerationOrchestrator,
     MediaProcessor,
+    check_api_key_connectivity,
+    check_veo_access,
+    get_api_key,
+    set_gui_logger,
     validate_api_key,
 )
+import veo_generator as core
 
 
 def _open_in_os_player(path: str) -> None:
@@ -85,13 +91,8 @@ class VeoGUIApp:
         page.window.height = 860
         page.padding = 12
 
-        # --- API key validation up front ---
-        try:
-            validate_api_key()
-        except ApiKeyError as e:
-            page.add(ft.Text(f"Configuration error: {e}",
-                             color=ft.Colors.RED_400, size=16))
-            return
+        # --- API key: optional at startup; collected via dialog instead ---
+        self._key_persisted = os.path.exists(core.ENV_FILE) and bool(get_api_key())
 
         # Log-message queue drained by the pump thread (worker-safe).
         self._log_queue: "queue.Queue[str]" = queue.Queue()
@@ -104,9 +105,14 @@ class VeoGUIApp:
 
         # Orchestrator routes progress lines into our queue;
         # progress_cb feeds the status-bar progress bar (percent, stage).
-        self.orch = GenerationOrchestrator(log_fn=self._enqueue_log,
-                                           progress_cb=self._on_progress)
+        # require_key=False lets the app start with no key configured —
+        # GenAIService builds its client lazily once a key is entered.
+        self.orch = GenerationOrchestrator(
+            ai=core.GenAIService(require_key=False),
+            log_fn=self._enqueue_log, progress_cb=self._on_progress)
         self.ai = self.orch.ai
+        # Forward all core-module diagnostics ([API]/[LLM] lines) to our log.
+        set_gui_logger(self._enqueue_log)
         Config.ensure_dirs()
 
         # Bridge Mode State
@@ -121,6 +127,10 @@ class VeoGUIApp:
 
         self._pump_thread = threading.Thread(target=self._pump, daemon=True)
         self._pump_thread.start()
+
+        if not self.ai.has_api_key:
+            self._enqueue_log("API-ключ не настроен — вставьте ключ в окне и нажмите «Сохранить».")
+            self._show_api_key_dialog(reason="Ключ GEMINI_API_KEY ещё не настроен.")
 
     # ------------------------------------------------------------------ #
     # Threading plumbing
@@ -197,6 +207,161 @@ class VeoGUIApp:
         threading.Thread(target=wrapper, daemon=True).start()
 
     # ------------------------------------------------------------------ #
+    # API key dialog / diagnostics
+    # ------------------------------------------------------------------ #
+
+    def _update_key_status(self) -> None:
+        try:
+            if self.ai.has_api_key:
+                tail = get_api_key()[-4:]
+                saved = "сохранён в .env" if self._key_persisted else "НЕ сохранён"
+                self.key_status.value = f"API-ключ: …{tail} ({saved})"
+                self.key_status.color = ft.Colors.GREEN_400 if self._key_persisted else ft.Colors.AMBER_400
+            else:
+                self.key_status.value = "API-ключ не задан"
+                self.key_status.color = ft.Colors.RED_400
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _show_api_key_dialog(self, reason: Optional[str] = None) -> None:
+        """Modal dialog to paste a GEMINI_API_KEY (save / test / cancel)."""
+        if getattr(self, "_key_dlg_open", False):
+            return
+        self._key_dlg_open = True
+        current = get_api_key()
+        masked = ("AIza…" + current[-4:]) if current else ""
+        field = ft.TextField(
+            label="GEMINI_API_KEY (вставьте ключ из https://aistudio.google.com/apikey)",
+            password=True, can_reveal_password=True, width=520,
+            hint_text=masked or "AIzaSy...", autofocus=True,
+            shift_enter=True if False else None,
+        )
+        info = ft.Text(reason or "", color=ft.Colors.AMBER_300, size=12, visible=bool(reason))
+        result = ft.Text("", size=12, selectable=True)
+
+        def close(e=None) -> None:
+            self._key_dlg_open = False
+            try:
+                self.page.close(dlg)
+            except Exception:  # noqa: BLE001
+                pass
+
+        def do_save(e=None) -> None:
+            key = (field.value or "").strip()
+            try:
+                self.ai.set_api_key(key, persist=True)
+                self._key_persisted = True
+                result.value = "✓ Ключ принят и сохранён в .env — следующий запуск без вопросов."
+                result.color = ft.Colors.GREEN_400
+                self._enqueue_log("API-ключ сохранён в .env.")
+                self._update_key_status()
+                try:
+                    result.update(); info.value = ""; info.update()
+                except Exception:  # noqa: BLE001
+                    pass
+            except ApiKeyError as ex:
+                result.value = f"✗ {ex}"
+                result.color = ft.Colors.RED_400
+                try:
+                    result.update()
+                except Exception:  # noqa: BLE001
+                    pass
+
+        def do_test(e=None) -> None:
+            key = (field.value or "").strip() or get_api_key()
+            if not key:
+                result.value = "Сначала вставьте ключ."
+                result.color = ft.Colors.RED_400
+                try:
+                    result.update()
+                except Exception:  # noqa: BLE001
+                    return
+            result.value = "Проверяю (бесплатно, без квоты генерации)..."
+            result.color = ft.Colors.GREY_400
+            try:
+                result.update()
+            except Exception:  # noqa: BLE001
+                pass
+
+            def worker() -> None:
+                ok_k, msg = check_api_key_connectivity(key)
+                ok_v, lines = check_veo_access(key)
+                text = "\n".join([f"Ключ: {'OK' if ok_k else 'FAIL'} — {msg}"] + lines +
+                                 ["ИТОГ: Veo доступен ✓" if ok_v else
+                                  "ИТОГ: Veo НЕдоступен — см. строки выше"])
+                result.value = text
+                result.color = ft.Colors.GREEN_400 if ok_v else ft.Colors.RED_400
+                try:
+                    result.update()
+                except Exception:  # noqa: BLE001
+                    pass
+                for ln in ([f"[CHECK] Ключ: {'OK' if ok_k else 'FAIL'} — {msg}"] +
+                           [f"[CHECK] {l}" for l in lines]):
+                    self._enqueue_log(ln)
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        dlg = ft.AlertDialog(
+            modal=True,
+            title=ft.Text("Google API-ключ (Gemini / Veo)"),
+            content=ft.Column([info, field, result], spacing=10,
+                              tight=True, width=560),
+            actions=[
+                ft.TextButton("Отмена", on_click=close),
+                ft.OutlinedButton("Проверить", on_click=do_test),
+                ft.FilledButton("Сохранить", on_click=do_save),
+            ],
+            actions_alignment=ft.MainAxisAlignment.END,
+        )
+        try:
+            self.page.show(dlg)
+        except Exception:  # noqa: BLE001
+            self.page.open(dlg)
+
+    def _run_key_check(self, e=None) -> None:
+        """Header button: run the full connectivity + Veo-access diagnostic."""
+        if not self.ai.has_api_key:
+            self._show_api_key_dialog(reason="Нет ключа для проверки — вставьте его.")
+            return
+
+        def task() -> None:
+            key = get_api_key()
+            ok_k, msg = check_api_key_connectivity(key)
+            self._enqueue_log(f"[CHECK] Связность ключа: {'OK' if ok_k else 'FAIL'} — {msg}")
+            ok_v, lines = check_veo_access(key)
+            for ln in lines:
+                self._enqueue_log(f"[CHECK] {ln}")
+            self._enqueue_log("[CHECK] ИТОГ: " + (
+                "Veo доступен для этого ключа ✓ — можно генерировать."
+                if ok_v else
+                "Veo НЕдоступен ✗ — вероятная причина сбоя генерации: нужен "
+                "платный тариф с Veo или другой VEO_MODEL_VIDEO."))
+
+        self._run_in_thread(task)
+
+    def _persist_key_after_success(self) -> None:
+        """After a *successful* generation, save the session key to .env."""
+        if self._key_persisted or not self.ai.api_key:
+            return
+        try:
+            self.ai.set_api_key(self.ai.api_key, persist=True)
+            self._key_persisted = True
+            self._enqueue_log("Ключ сохранён в .env (генерация прошла успешно) — "
+                              "при следующем запуске вводить его не нужно.")
+            self._update_key_status()
+        except ApiKeyError as e:
+            self._enqueue_log(f"Не удалось сохранить ключ: {e}")
+
+    def _on_generation_exception(self, exc: Exception) -> str:
+        """Uniform handling of errors raised out of the orchestrator."""
+        if isinstance(exc, ApiKeyError):
+            self._show_api_key_dialog(reason="Для генерации нужен API-ключ — вставьте его.")
+            return "нет API-ключа (окно ввода открыто)"
+        if isinstance(exc, GenerationError):
+            return str(exc)
+        return f"{type(exc).__name__}: {exc}"
+
+    # ------------------------------------------------------------------ #
     # UI construction
     # ------------------------------------------------------------------ #
 
@@ -262,8 +427,19 @@ class VeoGUIApp:
         self.tab_stack = ft.Stack(controls=list(self._panel_containers.values()),
                                   expand=True)
 
+        # Header: API-key status + buttons (works even when no key is set).
+        self.key_status = ft.Text("", size=12)
+        self._update_key_status()
+        header = ft.Row(
+            [self.key_status,
+             ft.FilledTonalButton("🔑 API Key", on_click=lambda e: self._show_api_key_dialog()),
+             ft.OutlinedButton("Проверить ключ и доступ к Veo",
+                               on_click=self._run_key_check)],
+            alignment=ft.MainAxisAlignment.END, spacing=8, wrap=True,
+        )
+
         self.root_view = ft.Column(
-            [self.tab_bar, self.tab_stack, console_col, ft.Divider(), status_row],
+            [header, self.tab_bar, self.tab_stack, console_col, ft.Divider(), status_row],
             expand=True, spacing=10,
         )
 
@@ -574,17 +750,34 @@ class VeoGUIApp:
 
         def task() -> None:
             self._enqueue_log("Starting Video Generation...")
-            out = self.orch.single_video(
-                prompt, aspect_ratio=opts.aspect_ratio, resolution=opts.resolution,
-                negative_prompt=neg, auto_negative=auto_neg,
-                expand=expand, duration_seconds=duration,
-                generate_audio=opts.audio, upsampling=opts.upscale)
+            self._enqueue_log(f"[CFG] модель={Config.MODEL_VIDEO}, разрешение={opts.resolution}, "
+                              f"аспект={opts.aspect_ratio}, длительность={duration or 'авто'}с, "
+                              f"звук={opts.audio}, upscale={opts.upscale}, "
+                              f"автонегатив={auto_neg}, расширение={expand}")
+            self._enqueue_log(f"[CFG] API-ключ: {'задан' if self.ai.has_api_key else 'НЕ задан'}, "
+                              f".env: {core.ENV_FILE}")
+            try:
+                out = self.orch.single_video(
+                    prompt, aspect_ratio=opts.aspect_ratio, resolution=opts.resolution,
+                    negative_prompt=neg, auto_negative=auto_neg,
+                    expand=expand, duration_seconds=duration,
+                    generate_audio=opts.audio, upsampling=opts.upscale,
+                    on_error=lambda msg: self._enqueue_log(f"[ERROR] {msg}"))
+            except ApiKeyError as e:
+                self._enqueue_log(f"[ERROR] {e}")
+                self._show_api_key_dialog(reason="Нет API-ключа — вставьте его, затем повторите Generate.")
+                return
             if out:
                 self._last_video = out
-                self._enqueue_log(f"Done! Saved: {out}")
+                size_mb = os.path.getsize(out) / 1e6 if os.path.exists(out) else 0.0
+                self._enqueue_log(f"Done! Saved: {out} ({size_mb:.2f} МБ)")
+                # Persist an ad-hoc key only after a proven-good generation.
+                self._persist_key_after_success()
                 self._show_thumbnail(out)
             else:
-                self._enqueue_log("Generation failed or cancelled. See log above.")
+                reason = self.ai.last_error or "см. строки [API]/[ERROR] выше"
+                self._enqueue_log(f"Generation failed. Причина: {reason}")
+                self._enqueue_log("Совет: нажмите «Проверить ключ и доступ к Veo» вверху окна.")
 
         self._run_in_thread(task)
 
@@ -607,10 +800,16 @@ class VeoGUIApp:
         workers = self._parse_workers()
 
         def task() -> None:
-            self._enqueue_log(f"Batch: {len(prompts)} prompt(s)...")
-            results = self.orch.batch_generate(
-                prompts, resolution=opts.resolution, max_workers=workers,
-                generate_audio=opts.audio, upsampling=opts.upscale)
+            self._enqueue_log(f"Batch: {len(prompts)} prompt(s), модель={Config.MODEL_VIDEO}, "
+                              f"разрешение={opts.resolution}...")
+            try:
+                results = self.orch.batch_generate(
+                    prompts, resolution=opts.resolution, max_workers=workers,
+                    generate_audio=opts.audio, upsampling=opts.upscale)
+            except ApiKeyError as e:
+                self._enqueue_log(f"[ERROR] {e}")
+                self._show_api_key_dialog(reason="Для пакетной генерации нужен API-ключ.")
+                return
             ok = sum(1 for r in results if r)
             self._enqueue_log(f"Batch finished: {ok}/{len(prompts)} succeeded.")
             if ok:
@@ -628,11 +827,16 @@ class VeoGUIApp:
         opts = self.batch_opts
 
         def task() -> None:
-            self._enqueue_log(f"Chain: {len(prompts)} segment(s)...")
-            out = self.orch.run_chain(
-                prompts, aspect_ratio=opts.aspect_ratio,
-                resolution=opts.resolution, start_image=start_img,
-                generate_audio=opts.audio, upsampling=opts.upscale)
+            self._enqueue_log(f"Chain: {len(prompts)} segment(s), модель={Config.MODEL_VIDEO}...")
+            try:
+                out = self.orch.run_chain(
+                    prompts, aspect_ratio=opts.aspect_ratio,
+                    resolution=opts.resolution, start_image=start_img,
+                    generate_audio=opts.audio, upsampling=opts.upscale)
+            except ApiKeyError as e:
+                self._enqueue_log(f"[ERROR] {e}")
+                self._show_api_key_dialog(reason="Для цепочки нужен API-ключ.")
+                return
             if out:
                 self._last_video = out
                 self._enqueue_log(f"Chain saved: {out}")
@@ -666,7 +870,16 @@ class VeoGUIApp:
         fname = os.path.join(Config.OUTPUT_DIRS["image"], "ui_image.png")
 
         def task() -> None:
-            out = self.ai.generate_image(prompt, fname)
+            self._enqueue_log(f"[IMG] Модель изображения: {Config.MODEL_IMAGE}")
+            try:
+                out = self.ai.generate_image(prompt, fname)
+            except ApiKeyError as e:
+                self._enqueue_log(f"[ERROR] {e}")
+                self._show_api_key_dialog(reason="Для генерации изображения нужен API-ключ.")
+                return
+            except GenerationError as e:
+                self._enqueue_log(f"Изображение не создано: {e}")
+                return
             if out:
                 self._last_image = out
                 self._enqueue_log(f"Image saved: {out}")
@@ -684,7 +897,16 @@ class VeoGUIApp:
         fname = os.path.join(Config.OUTPUT_DIRS["audio"], "ui_audio.wav")
 
         def task() -> None:
-            out = self.ai.generate_audio(prompt, dur, fname)
+            self._enqueue_log(f"[AUD] Модель аудио: {Config.MODEL_AUDIO} (нужен платный тариф)")
+            try:
+                out = self.ai.generate_audio(prompt, dur, fname)
+            except ApiKeyError as e:
+                self._enqueue_log(f"[ERROR] {e}")
+                self._show_api_key_dialog(reason="Для генерации аудио нужен API-ключ.")
+                return
+            except GenerationError as e:
+                self._enqueue_log(f"Аудио не создано: {e}")
+                return
             if out:
                 self._last_audio = out
                 self._enqueue_log(f"Audio saved: {out}")
@@ -710,11 +932,16 @@ class VeoGUIApp:
         v2_prompt = (self.v2_gen_prompt.value or "").strip() or None
         bridge_prompt = (self.bridge_prompt.value or "").strip() or None
 
-        state = self.orch.bridge_step1_prepare(
-            v1, v2_existing, v2_prompt, bridge_prompt,
-            aspect_ratio=opts.aspect_ratio, resolution=opts.resolution,
-            generate_audio=opts.audio, upsampling=opts.upscale,
-        )
+        try:
+            state = self.orch.bridge_step1_prepare(
+                v1, v2_existing, v2_prompt, bridge_prompt,
+                aspect_ratio=opts.aspect_ratio, resolution=opts.resolution,
+                generate_audio=opts.audio, upsampling=opts.upscale,
+            )
+        except ApiKeyError as e:
+            self._enqueue_log(f"[ERROR] {e}")
+            self._show_api_key_dialog(reason="Для Bridge-режима нужен API-ключ.")
+            state = None
         if not state:
             self.btn_start_bridge.disabled = False
             self.btn_start_bridge.update()
@@ -791,19 +1018,14 @@ class VeoGUIApp:
 
 
 def main() -> None:
-    # Fail fast with a readable console message instead of opening a GUI
-    # window that cannot generate anything (Windows users double-click
-    # run.bat, where the console stays visible).
+    # The GUI opens even without a key — it shows an API-key dialog on
+    # startup instead of exiting (users double-clicking run.bat had no way
+    # to enter a key otherwise). A hint is still printed to the console.
     try:
         validate_api_key()
     except ApiKeyError as e:
-        print(f"Configuration error: {e}", file=sys.stderr)
-        print(
-            'Tip: copy .env.example to .env and set GEMINI_API_KEY '
-            '(get a key at https://aistudio.google.com/apikey).',
-            file=sys.stderr,
-        )
-        sys.exit(2)
+        print(f"Hint: {e}", file=sys.stderr)
+        print("GUI откроется и попросит вставить ключ.", file=sys.stderr)
     ft.run(VeoGUIApp)
 
 
