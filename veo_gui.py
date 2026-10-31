@@ -26,6 +26,8 @@ from veo_generator import (
     Config,
     FileManager,
     GenerationOrchestrator,
+    MediaProcessor,
+    TaskJournal,
     validate_api_key,
 )
 
@@ -34,7 +36,7 @@ class VeoGUIApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Veo3 Pro Generator UI")
-        self.root.geometry("900x700")
+        self.root.geometry("900x760")
 
         # --- API key validation up front (item 3) ---
         try:
@@ -46,9 +48,13 @@ class VeoGUIApp:
         # Log-message queue drained by the Tk main loop (item 2)
         self._log_queue: "queue.Queue[str]" = queue.Queue()
         self._stop_polling = threading.Event()
+        self._busy = False
+        self._thumb_photo: Optional[tk.PhotoImage] = None
 
-        # Orchestrator routes all core progress lines into our queue
-        self.orch = GenerationOrchestrator(log_fn=self._enqueue_log)
+        # Orchestrator routes all core progress lines into our queue;
+        # progress_cb feeds the status-bar progress bar (percent, stage).
+        self.orch = GenerationOrchestrator(log_fn=self._enqueue_log,
+                                           progress_cb=self._on_progress)
         self.ai = self.orch.ai
         Config.ensure_dirs()
 
@@ -56,6 +62,8 @@ class VeoGUIApp:
         self.res_var = tk.StringVar(value="720p")
         self.ar_var = tk.StringVar(value="16:9")
         self.auto_neg_var = tk.BooleanVar(value=True)
+        self.upscale_var = tk.BooleanVar(value=bool(Config.UPSCALE_DEFAULT))
+        self.audio_var = tk.BooleanVar(value=True)
 
         # Bridge Mode State
         self.bridge_state: dict = {
@@ -98,6 +106,37 @@ class VeoGUIApp:
         self.console.insert("end", text.rstrip("\n") + "\n")
         self.console.see("end")
         self.console.configure(state="disabled")
+
+    def _on_progress(self, pct: Optional[int], stage: str = "") -> None:
+        """progress_cb from worker threads — marshal to the Tk main thread."""
+        self._ui(lambda: self._apply_progress(pct, stage))
+
+    def _apply_progress(self, pct: Optional[int], stage: str = "") -> None:
+        if pct is None:            # indeterminate (waiting on API, unknown ETA)
+            self.progress_bar.config(mode="indeterminate")
+            self.progress_bar.start(12)
+            self.progress_label.config(text=stage or "working...")
+        else:
+            self.progress_bar.stop()
+            self.progress_bar.config(mode="determinate", value=max(0, min(100, pct)))
+            self.progress_label.config(text=f"{stage} {pct}%" if stage else f"{pct}%")
+
+    def _set_busy(self, busy: bool) -> None:
+        """Toggle the Cancel button / progress animation around a long task."""
+        self._busy = busy
+        if busy:
+            self.progress_bar.config(mode="indeterminate")
+            self.progress_bar.start(12)
+            self.btn_cancel.configure(state="normal")
+        else:
+            self.progress_bar.stop()
+            self.progress_bar.config(mode="determinate", value=0)
+            self.progress_label.config(text="Idle")
+            self.btn_cancel.configure(state="disabled")
+
+    def _cancel_current(self) -> None:
+        self.orch.cancel()
+        self._enqueue_log("Cancellation requested — finishing current API call, then stopping...")
 
     def _ui(self, fn: Callable[[], None]) -> None:
         """Schedule a callable on the Tk main thread."""

@@ -1074,6 +1074,7 @@ class GenerationOrchestrator:
         first_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "chain_segment_1", ".mp4")
         kwargs = dict(aspect_ratio=aspect_ratio, resolution=resolution, generate_audio=generate_audio,
                       upsampling=upsampling)
+        self._report_progress(5, "segment 1/{}".format(total))
         v = self.ai.generate_video(remaining.pop(0), first_name, image_path=start_image, **kwargs)
         if not v:
             self.log("First chain segment failed.")
@@ -1241,7 +1242,8 @@ class GenerationOrchestrator:
         b_prompt = bridge_prompt or "Smooth transition between the two scenes, cinematic"
         b_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "bridge_seg", ".mp4")
         if not self.ai.generate_video(b_prompt, b_name, image_path=f1, last_frame_path=f2,
-                                      aspect_ratio=aspect_ratio, resolution=resolution):
+                                      aspect_ratio=aspect_ratio, resolution=resolution,
+                                      generate_audio=generate_audio, upsampling=upsampling):
             self.log("Bridge generation failed.")
             FileManager.cleanup_files(state["temp_files"])
             return None
@@ -1289,7 +1291,9 @@ class GenerationOrchestrator:
         new_v2 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "v2_regen", ".mp4")
         v = self.ai.generate_video(new_v2_prompt, new_v2, image_path=bridge_end_frame,
                                    aspect_ratio=state.get("aspect_ratio", "16:9"),
-                                   resolution=state.get("resolution", "720p"))
+                                   resolution=state.get("resolution", "720p"),
+                                   generate_audio=state.get("generate_audio", True),
+                                   upsampling=state.get("upsampling"))
         if not v:
             self.log("Regeneration failed; keeping previous Video 2.")
             return None
@@ -1300,6 +1304,7 @@ class GenerationOrchestrator:
 
     def bridge_accept(self, state: dict, dest: Optional[str] = None) -> Optional[str]:
         """Move the accepted preview to its final destination and clean temps."""
+        start = time.time()
         if not state.get("preview") or not os.path.exists(state["preview"]):
             self.log("No preview available to save.")
             return None
@@ -1321,6 +1326,7 @@ class GenerationOrchestrator:
                 os.remove(state["preview"])
             except OSError:
                 pass
+        self.ai._journal.record("bridge", "ok", output=dest, duration_s=time.time() - start)
         return dest
 
     @staticmethod
@@ -1346,6 +1352,35 @@ class VeoGeneratorApp:
         self.orch = orchestrator or GenerationOrchestrator()
         self.running = True
 
+    @staticmethod
+    def show_tasks(limit: int = 20, as_json: bool = False) -> int:
+        """Print the task journal (``python veo_generator.py tasks``)."""
+        Config.ensure_dirs()
+        j = TaskJournal(Config.TASKS_JOURNAL_FILE)
+        if as_json:
+            print(json.dumps({"stats": j.stats(), "recent": j.load(limit)}, ensure_ascii=False, indent=2))
+            return 0
+        st = j.stats()
+        print(f"Journal file: {j.path}")
+        print(f"Total {st['total']} | ok {st['ok']} | failed {st['failed']} | avg {st['avg_duration_s']}s")
+        for kind, counters in sorted(st["by_kind"].items()):
+            print(f"  {kind:12s} ok={counters.get('ok', 0)} failed={counters.get('failed', 0)}")
+        entries = j.load(limit)
+        if not entries:
+            print("(no tasks recorded yet)")
+        else:
+            print(f"\nLast {len(entries)} task(s):")
+            for e in entries:
+                line = f"[{e.get('ts')}] {e.get('kind'):8s} {e.get('status'):7s} {e.get('duration_s', 0)}s"
+                if e.get("prompt"):
+                    line += f" | {e['prompt'][:60]}"
+                if e.get("output"):
+                    line += f" -> {os.path.basename(e['output'])}"
+                if e.get("error"):
+                    line += f" | ERROR: {e['error'][:80]}"
+                print(line)
+        return 0
+
     def run(self) -> None:
         while self.running:
             try:
@@ -1366,6 +1401,7 @@ class VeoGeneratorApp:
         print("6. Bridge between videos (Interpolation with Verification)")
         print("7. Resume interrupted chain")
         print("8. Show prompt history")
+        print("9. Task journal / stats")
         print("0. Exit")
 
         choice = input("Select mode: ")
@@ -1389,6 +1425,31 @@ class VeoGeneratorApp:
         elif choice == "8":
             for h in FileManager.load_history(20):
                 print(f"[{h['ts']}] ({h['kind']}) {h['prompt'][:80]}")
+        elif choice == "9":
+            self.show_task_stats()
+
+    def show_task_stats(self) -> None:
+        j = self.orch.ai._journal
+        st = j.stats()
+        print(f"Journal: {j.path}")
+        print(f"Total {st['total']} | ok {st['ok']} | failed {st['failed']} "
+              f"| avg duration {st['avg_duration_s']}s")
+        for kind, counters in sorted(st["by_kind"].items()):
+            print(f"  {kind:12s} ok={counters.get('ok', 0)} failed={counters.get('failed', 0)}")
+        recent = j.load(10)
+        if recent:
+            print("Recent tasks:")
+            for e in recent:
+                err = f" ERROR: {e['error'][:60]}" if e.get("error") else ""
+                print(f"  [{e.get('ts')}] ({e.get('kind')}) {e.get('status')} "
+                      f"{e.get('duration_s', 0)}s{err}")
+
+    def _ask_audio_upscale(self) -> tuple[bool, Optional[bool]]:
+        """Ask about generated audio and native upsampling (single video flow)."""
+        a = input("Generate audio in video? (Y/n): ").strip().lower()
+        generate_audio = a not in ("n", "no")
+        u = input("Upscale to 1080p via API (Veo 3.1)? (y/N): ").strip().lower()
+        return generate_audio, (True if u in ("y", "yes") else None)
 
     def _ask_resolution(self) -> str:
         # Official docs: veo-3.1-generate-001 supports 720p/1080p only;
@@ -1417,12 +1478,25 @@ class VeoGeneratorApp:
         refs: list[str] = []
         c_ref = input("Add reference images? (y/n): ").lower()
         if c_ref == "y":
-            print("Enter image paths (max 3); empty line to finish:")
+            print("Enter image paths (max 3); empty line to finish.")
+            print("Tip: prefix a path with 'style:' or 'asset:' to force its role.")
             while len(refs) < 3:
                 p_ref = input(f"Image {len(refs) + 1}: ").strip('"').strip()
                 if not p_ref:
                     break
-                if os.path.exists(p_ref):
+                # 'style:/path' or 'asset:C:\path' -> check the path part after the role prefix
+                low = p_ref.lower()
+                candidate = p_ref
+                for role in ("style:", "asset:"):
+                    if low.startswith(role):
+                        rest = p_ref[len(role):]
+                        # a Windows drive letter (e.g. 'asset:D:\\x.png') still has ':' at pos 2
+                        if len(rest) > 1 and rest[1:2] == ":":
+                            candidate = rest          # 'D:\x.png' - keep as-is, no strip needed
+                        else:
+                            candidate = rest.strip()
+                        break
+                if os.path.exists(candidate):
                     refs.append(p_ref)
                 else:
                     print("File not found.")
@@ -1450,10 +1524,12 @@ class VeoGeneratorApp:
         duration = int(dur) if dur.isdigit() else None
 
         neg, refs, last_frame = self._configure_advanced_options(prompt)
+        generate_audio, upsampling = self._ask_audio_upscale()
 
         self.orch.single_video(prompt, fname, aspect_ratio=ratio, resolution=res,
                                duration_seconds=duration, negative_prompt=neg,
-                               reference_image_paths=refs, last_frame_path=last_frame)
+                               reference_image_paths=refs, last_frame_path=last_frame,
+                               generate_audio=generate_audio, upsampling=upsampling)
 
     def handle_image_gen(self) -> None:
         p = input("Prompt: ")
@@ -1480,7 +1556,9 @@ class VeoGeneratorApp:
             raw = input("Prompts separated by ';': ")
             prompts = [x.strip() for x in raw.split(";") if x.strip()]
             res = self._ask_resolution()
-            self.orch.batch_generate(prompts, resolution=res)
+            generate_audio, upsampling = self._ask_audio_upscale()
+            self.orch.batch_generate(prompts, resolution=res,
+                                     generate_audio=generate_audio, upsampling=upsampling)
 
         elif sub == "2":
             print(f"Videos must be located in: {Config.OUTPUT_DIRS['video']}")
@@ -1551,9 +1629,12 @@ class VeoGeneratorApp:
             return
 
         prompt_bridge = input("Transition prompt (Enter for auto): ") or None
+        generate_audio, upsampling = self._ask_audio_upscale()
 
         state = self.orch.bridge_step1_prepare(p1, v2_existing, v2_prompt, prompt_bridge,
-                                               aspect_ratio=ratio, resolution=res)
+                                               aspect_ratio=ratio, resolution=res,
+                                               generate_audio=generate_audio,
+                                               upsampling=upsampling)
         if not state:
             return
 
@@ -1616,6 +1697,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     vid.add_argument("--no-auto-negative", action="store_true", help="skip LLM negative-prompt call (saves quota)")
     vid.add_argument("--template", default=None, help="apply a named prompt template")
     vid.add_argument("--expand", action="store_true", help="expand prompt via LLM before generating")
+    vid.add_argument("--no-audio", dest="audio", action="store_false", default=True,
+                     help="do not generate audio track inside the video")
+    vid.add_argument("--upscale", dest="upsampling", action="store_true", default=None,
+                     help="ask Veo 3.1 API to upscale output to 1080p (env VEO_UPSCALE=true for default)")
 
     img = sub.add_parser("image", help="one-shot image generation")
     img.add_argument("prompt")
@@ -1630,6 +1715,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     bat.add_argument("prompts_file")
     bat.add_argument("--resolution", default="720p")
     bat.add_argument("--workers", type=int, default=None)
+    bat.add_argument("--no-audio", dest="audio", action="store_false", default=True)
+    bat.add_argument("--upscale", dest="upsampling", action="store_true", default=None)
+
+    tsk = sub.add_parser("tasks", help="show task journal / statistics")
+    tsk.add_argument("--limit", type=int, default=20, help="how many recent tasks to print")
+    tsk.add_argument("--json", action="store_true", help="machine-readable output")
 
     return parser
 
@@ -1645,6 +1736,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"Configuration error: {e}", file=sys.stderr)
         return 2
 
+    # 'tasks' is a read-only reporting command: no orchestrator / API calls needed.
+    if args.command == "tasks":
+        return VeoGeneratorApp.show_tasks(limit=args.limit, as_json=args.json)
+
     Config.ensure_dirs()
     orch = GenerationOrchestrator()
 
@@ -1656,6 +1751,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             last_frame_path=args.last_frame, negative_prompt=args.negative_prompt,
             auto_negative=not args.no_auto_negative,
             template=args.template, expand=args.expand,
+            generate_audio=args.audio, upsampling=args.upsampling,
         )
         return 0 if out else 1
     if args.command == "image":
@@ -1671,7 +1767,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         except OSError as e:
             print(f"Cannot read prompts file: {e}", file=sys.stderr)
             return 2
-        results = orch.batch_generate(prompts, resolution=args.resolution, max_workers=args.workers)
+        results = orch.batch_generate(prompts, resolution=args.resolution, max_workers=args.workers,
+                                      generate_audio=args.audio, upsampling=args.upsampling)
         return 0 if all(results) else 1
 
     # Default: interactive menu
