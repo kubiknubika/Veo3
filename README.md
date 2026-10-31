@@ -50,6 +50,20 @@ Advanced AI Media Generation tool powered by Google Gemini (Veo 3.1, Imagen 4, L
 
 To use it **like an installed app**: right-click `VeoGUI.vbs` (or `run.bat`) → *Send to → Desktop (create shortcut)*, then rename the shortcut to "Veo3 Generator" and pin it to the taskbar/Start.
 
+Or create the shortcut automatically (icon, description, hotkey included) — run once in PowerShell:
+
+```powershell
+$w = New-Object -ComObject WScript.Shell
+$s = $w.CreateShortcut("$env:USERPROFILE\Desktop\Veo3 Generator.lnk")
+$s.TargetPath = "$PWD\VeoGUI.vbs"
+$s.WorkingDirectory = "$PWD"
+$s.IconLocation = "$PWD\.venv\Scripts\pythonw.exe,0"
+$s.Description  = "Veo3 Pro Generator"
+$s.Save()
+```
+
+The `.lnk` is a few hundred bytes and points at the repo folder; if you move the repo, recreate it.
+
 **Standalone .exe (no Python needed on the target PC)** — build once on any Windows machine where you already ran `run.bat`:
 
 ```powershell
