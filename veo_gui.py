@@ -140,8 +140,12 @@ class VeoGUIApp:
 
     def _options_row(self, parent: ttk.Frame, row: int) -> None:
         """Shared resolution/aspect controls bound to app-level StringVars."""
+        # 4k is only offered for the preview model (official Veo 3.1 docs).
+        res_values = ["720p", "1080p"] + (["4k"] if "preview" in Config.MODEL_VIDEO else [])
+        if self.res_var.get() not in res_values:
+            self.res_var.set("720p")
         ttk.Label(parent, text="Resolution:").grid(row=row, column=0, padx=5, sticky=tk.W)
-        ttk.Combobox(parent, textvariable=self.res_var, values=["720p", "1080p", "4k"],
+        ttk.Combobox(parent, textvariable=self.res_var, values=res_values,
                      state="readonly", width=8).grid(row=row, column=1, padx=5)
         ttk.Label(parent, text="Aspect Ratio:").grid(row=row, column=2, padx=5, sticky=tk.W)
         ttk.Combobox(parent, textvariable=self.ar_var, values=["16:9", "9:16"],
@@ -330,7 +334,14 @@ class VeoGUIApp:
 
     def _parse_duration(self) -> Optional[int]:
         raw = self.dur_var.get().strip()
-        return int(raw) if raw.isdigit() else None
+        if not raw.isdigit():
+            return None
+        dur = int(raw)
+        lo, hi = Config.MIN_DURATION_S, Config.MAX_DURATION_S
+        if not lo <= dur <= hi:
+            dur = max(lo, min(dur, hi))
+            self._enqueue_log(f"Duration clamped to Veo 3.1 range {lo}-{hi}s: using {dur}s.")
+        return dur
 
     # ------------------------------------------------------------------ #
     # Actions — all flows go through the shared orchestrator (item 8)

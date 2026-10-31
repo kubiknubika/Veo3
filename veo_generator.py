@@ -48,10 +48,12 @@ logger = logging.getLogger("veo")
 class AppConfig:
     """Runtime configuration, overridable via environment / .env file."""
 
-    MODEL_VIDEO: str = os.getenv("VEO_MODEL_VIDEO", "veo-3.1-generate-preview")
+    # Official stable Vertex AI model ID (ai.google.dev Veo 3.1 docs); the
+    # ``-preview`` variant is deprecated. Override via .env if needed.
+    MODEL_VIDEO: str = os.getenv("VEO_MODEL_VIDEO", "veo-3.1-generate-001")
     MODEL_IMAGE: str = os.getenv("VEO_MODEL_IMAGE", "gemini-2.5-flash-image")
-    MODEL_TEXT: str = os.getenv("VEO_MODEL_TEXT", "gemini-3.0-flash-preview")
-    MODEL_AUDIO: str = os.getenv("VEO_MODEL_AUDIO", "models/lyria-realtime-exp")
+    MODEL_TEXT: str = os.getenv("VEO_MODEL_TEXT", "gemini-2.5-flash")
+    MODEL_AUDIO: str = os.getenv("VEO_MODEL_AUDIO", "lyria-002")
     TOKEN_LIMIT: int = int(os.getenv("VEO_TOKEN_LIMIT", "1000"))
 
     # Polling / retry tuning
@@ -63,13 +65,16 @@ class AppConfig:
     # Batch concurrency
     BATCH_WORKERS: int = int(os.getenv("VEO_BATCH_WORKERS", "3"))
 
-    # Generation defaults
+    # Generation defaults (Veo 3.1 supports durations in whole seconds 4-60)
+    MIN_DURATION_S: int = int(os.getenv("VEO_MIN_DURATION", "4"))
+    MAX_DURATION_S: int = int(os.getenv("VEO_MAX_DURATION", "60"))
     DEFAULT_DURATION_S: int = int(os.getenv("VEO_DURATION", "8"))
     GENERATE_NEGATIVE_PROMPT: bool = os.getenv("VEO_AUTO_NEGATIVE", "true").lower() in ("1", "true", "yes")
 
+    # Lyria Live Music streams 48 kHz / stereo / 16-bit PCM.
     AUDIO_SAMPLE_RATE: int = int(os.getenv("VEO_AUDIO_SAMPLE_RATE", "48000"))
     AUDIO_CHANNELS: int = int(os.getenv("VEO_AUDIO_CHANNELS", "2"))
-    AUDIO_SAMPLE_WIDTH: int = int(os.getenv("VEO_AUDIO_SAMPLE_WIDTH", "2"))
+    AUDIO_SAMPLE_WIDTH: int = 2  # 16-bit PCM (fixed by the API)
 
     if getattr(sys, "frozen", False):
         BASE_DIR: str = os.path.dirname(sys.executable)
@@ -108,11 +113,27 @@ class ApiKeyError(RuntimeError):
 
 
 def validate_api_key() -> str:
-    """Return the API key or raise :class:`ApiKeyError` early at startup."""
+    """Return the API key or raise :class:`ApiKeyError` early at startup.
+
+    Performs an offline format check (Google AI Studio keys are 35+ chars
+    starting with ``AIza``); a live network validation is issued lazily by
+    the first API call so no extra quota is spent on startup.
+    """
     key = (os.environ.get("GEMINI_API_KEY") or "").strip()
     if not key:
         raise ApiKeyError(
             "GEMINI_API_KEY is not set. Create a .env file with GEMINI_API_KEY=your_key"
+        )
+    placeholders = ("your_", "placeholder", "xxx", "changeme", "insert")
+    if any(p in key.lower() for p in placeholders) or len(key) < 20:
+        raise ApiKeyError(
+            "GEMINI_API_KEY looks like a placeholder or is too short. "
+            "Get a real key at https://aistudio.google.com/apikey"
+        )
+    if key.startswith("AIza") and len(key) < 35:
+        raise ApiKeyError(
+            f"GEMINI_API_KEY has an invalid length ({len(key)}); "
+            "Google API keys are 35+ characters. Check for truncation."
         )
     return key
 
@@ -428,7 +449,13 @@ class GenAIService:
         negative_prompt: Optional[str] = None,
         reference_image_paths: Optional[list[str]] = None,
     ) -> Optional[str]:
-        """Generate a single Veo clip. Returns the output path or ``None``."""
+        """Generate a single Veo clip. Returns the output path or ``None``.
+
+        Parameter constraints follow the official Veo 3.1 docs:
+        * resolution: 720p / 1080p (4k only for veo-3.1-generate-preview);
+        * duration_seconds: whole seconds in [4, 60];
+        * reference images: ASSET up to 3, STYLE up to 3 per request.
+        """
         logger.info("Generating video: '%s' [%s, %s]", prompt, resolution, aspect_ratio)
         FileManager.record_prompt(prompt, "video", output_filename)
 
@@ -440,21 +467,43 @@ class GenAIService:
             config_params: dict = {
                 "aspect_ratio": aspect_ratio,
                 "resolution": resolution,
-                "person_generation": "ALLOW_ADULT",
+                "person_generation": "allow_adult",
                 "generate_audio": generate_audio,
             }
             if duration_seconds:
-                config_params["duration_seconds"] = duration_seconds
+                dur = int(duration_seconds)
+                if not Config.MIN_DURATION_S <= dur <= Config.MAX_DURATION_S:
+                    dur = max(Config.MIN_DURATION_S, min(dur, Config.MAX_DURATION_S))
+                    logger.warning(
+                        "Duration must be %d-%d seconds; adjusted to %d.",
+                        Config.MIN_DURATION_S, Config.MAX_DURATION_S, dur,
+                    )
+                config_params["duration_seconds"] = dur
 
             if negative_prompt:
                 config_params["negative_prompt"] = negative_prompt
 
             if reference_image_paths:
                 refs = []
-                for p in reference_image_paths[:3]:
-                    img_obj = self._get_image_param(p)
+                # Official limits: max 3 ASSET and max 3 STYLE references.
+                asset_left, style_left = 3, 3
+                for p in reference_image_paths:
+                    kind = "STYLE" if "style:" in p.lower() else "ASSET"
+                    if kind == "STYLE":
+                        if style_left == 0:
+                            logger.warning("Ignoring extra STYLE reference (max 3): %s", p)
+                            continue
+                        style_left -= 1
+                        path = p.split("style:", 1)[1].strip() if "style:" in p.lower() else p
+                    else:
+                        if asset_left == 0:
+                            logger.warning("Ignoring extra ASSET reference (max 3): %s", p)
+                            continue
+                        asset_left -= 1
+                        path = p
+                    img_obj = self._get_image_param(path)
                     if img_obj:
-                        refs.append(types.VideoGenerationReferenceImage(image=img_obj, reference_type="ASSET"))
+                        refs.append(types.VideoGenerationReferenceImage(image=img_obj, reference_type=kind))
                 if refs:
                     config_params["reference_images"] = refs
 
@@ -523,7 +572,21 @@ class GenAIService:
             logger.error("Image generation failed: %s", e)
             return None
 
-    def generate_audio(self, prompt: str, duration_seconds: int = 10, output_filename: Optional[str] = None) -> Optional[str]:
+    def generate_audio(
+        self,
+        prompt: str,
+        duration_seconds: int = 10,
+        output_filename: Optional[str] = None,
+        bpm: int = 120,
+        temperature: float = 1.0,
+        seed: Optional[int] = None,
+    ) -> Optional[str]:
+        """Stream music from Lyria (Live Music API, v1alpha) into a WAV file.
+
+        Note: per official docs the Live Music API is available on paid
+        tiers only; free-tier keys receive a permission error here (Veo
+        itself remains usable via ``generate_video``).
+        """
         if not output_filename:
             output_filename = FileManager.get_unique_filename(Config.OUTPUT_DIRS["audio"], "generated_music", ".wav")
 
@@ -544,8 +607,11 @@ class GenAIService:
             try:
                 async with client_lyria.aio.live.music.connect(model=Config.MODEL_AUDIO) as session:
                     await session.set_weighted_prompts(prompts=[types.WeightedPrompt(text=prompt, weight=1.0)])
+                    cfg_params: dict = {"bpm": bpm, "temperature": temperature}
+                    if seed is not None:
+                        cfg_params["seed"] = seed
                     await session.set_music_generation_config(
-                        config=types.LiveMusicGenerationConfig(bpm=120, temperature=1.0)
+                        config=types.LiveMusicGenerationConfig(**cfg_params)
                     )
                     await session.play()
                     logger.info("Recording audio stream...")
@@ -566,7 +632,14 @@ class GenAIService:
                     logger.info("Audio generation finished.")
                     return bytes(audio_buffer), framerate, channels, sample_width
             except Exception as e:  # noqa: BLE001
-                logger.error("Lyria session error: %s", e)
+                err = str(e)
+                if "PERMISSION_DENIED" in err or "403" in err:
+                    logger.error(
+                        "Lyria access denied — the Live Music API requires a "
+                        "paid (Tier 1+) API key. Veo video generation is unaffected."
+                    )
+                else:
+                    logger.error("Lyria session error: %s", e)
                 return None
 
         try:
@@ -984,14 +1057,17 @@ class VeoGeneratorApp:
                 print(f"[{h['ts']}] ({h['kind']}) {h['prompt'][:80]}")
 
     def _ask_resolution(self) -> str:
+        # Official docs: veo-3.1-generate-001 supports 720p/1080p only;
+        # 4k requires the deprecated veo-3.1-generate-preview model.
         print("Resolution:")
         print("1. 720p (fast, less quota)")
         print("2. 1080p (HD)")
-        print("3. 4k (UHD)")
+        if "preview" in Config.MODEL_VIDEO:
+            print("3. 4k (UHD, preview model only)")
         c = input("Choice (1): ")
         if c == "2":
             return "1080p"
-        if c == "3":
+        if c == "3" and "preview" in Config.MODEL_VIDEO:
             return "4k"
         return "720p"
 
@@ -1195,9 +1271,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     vid = sub.add_parser("video", help="one-shot video generation")
     vid.add_argument("prompt")
     vid.add_argument("--output")
-    vid.add_argument("--resolution", default="720p", choices=["720p", "1080p", "4k"])
+    vid.add_argument("--resolution", default="720p", choices=["720p", "1080p", "4k"],
+                     help="4k requires VEO_MODEL_VIDEO=veo-3.1-generate-preview")
     vid.add_argument("--aspect-ratio", default="16:9", choices=["16:9", "9:16"])
-    vid.add_argument("--duration", type=int, default=None)
+    vid.add_argument("--duration", type=int, default=None,
+                     help="clip length in whole seconds, 4-60 (Veo 3.1 docs)")
     vid.add_argument("--image", default=None, help="start-frame image path")
     vid.add_argument("--last-frame", default=None)
     vid.add_argument("--negative-prompt", default=None)

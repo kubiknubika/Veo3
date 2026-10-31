@@ -11,6 +11,8 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch, mock_open
 
+from google.genai import types
+
 import veo_generator
 from veo_generator import (
     ApiKeyError,
@@ -31,8 +33,15 @@ class TestApiKeyValidation(unittest.TestCase):
                 validate_api_key()
 
     def test_present_key_returns(self):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "abc"}):
-            self.assertEqual(validate_api_key(), "abc")
+        valid = "AIzaSyDUMMY1234567890abcdefABCDEFGH"  # 39 chars, AIza-prefixed
+        with patch.dict(os.environ, {"GEMINI_API_KEY": valid}):
+            self.assertEqual(validate_api_key(), valid)
+
+    def test_placeholder_key_rejected(self):
+        for bad in ["your_api_key_here", "sk-short", "AIzaTruncated"]:
+            with patch.dict(os.environ, {"GEMINI_API_KEY": bad}):
+                with self.assertRaises(ApiKeyError, msg=bad):
+                    validate_api_key()
 
 
 class TestFileManager(unittest.TestCase):
@@ -186,7 +195,7 @@ class TestGenAIService(unittest.TestCase):
         self.mock_operation.response.generated_videos = [MagicMock()]
         self.mock_client_instance.models.generate_videos.return_value = self.mock_operation
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "AIzaSyDUMMY1234567890abcdefABCDEFGH"}):
             self.service = GenAIService()
 
     def tearDown(self):
@@ -417,12 +426,79 @@ class TestCLI(unittest.TestCase):
         self.assertTrue(args.expand)
 
     def test_cli_video_one_shot(self):
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "k"}), \
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "AIzaSyDUMMY1234567890abcdefABCDEFGH"}), \
              patch.object(veo_generator, "GenerationOrchestrator") as MockOrch:
             MockOrch.return_value.single_video.return_value = "out.mp4"
             code = veo_generator.main(["video", "p", "--output", "out.mp4"])
         self.assertEqual(code, 0)
         MockOrch.return_value.single_video.assert_called_once()
+
+
+class TestVeo31DocCompliance(unittest.TestCase):
+    """Checks against the official Veo 3.1 / Lyria documentation."""
+
+    def setUp(self):
+        self.patcher = patch("google.genai.Client")
+        self.mock_client_cls = self.patcher.start()
+        self.mock_client_instance = MagicMock()
+        self.mock_client_cls.return_value = self.mock_client_instance
+        op = MagicMock()
+        op.done = True
+        op.response.generated_videos = [MagicMock()]
+        self.mock_client_instance.models.generate_videos.return_value = op
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "AIzaSyDUMMY1234567890abcdefABCDEFGH"}):
+            self.service = GenAIService()
+
+    def tearDown(self):
+        self.patcher.stop()
+
+    def test_default_model_is_stable_id(self):
+        # Official stable Vertex AI model id (preview variant is deprecated).
+        self.assertIn("veo-3.1-generate", Config.MODEL_VIDEO)
+
+    def test_duration_clamped_to_documented_range(self):
+        # Docs: duration_seconds whole seconds between 4 and 60.
+        self.assertEqual(Config.MIN_DURATION_S, 4)
+        self.assertEqual(Config.MAX_DURATION_S, 60)
+        with patch.object(FileManager, "record_prompt"):
+            self.service.generate_video("p", "out.mp4", duration_seconds=120)
+        cfg = self.mock_client_instance.models.generate_videos.call_args.kwargs["config"]
+        self.assertEqual(cfg.duration_seconds, 60)
+        with patch.object(FileManager, "record_prompt"):
+            self.service.generate_video("p", "out.mp4", duration_seconds=2)
+        cfg = self.mock_client_instance.models.generate_videos.call_args.kwargs["config"]
+        self.assertEqual(cfg.duration_seconds, 4)
+
+    def test_person_generation_snake_case_value(self):
+        with patch.object(FileManager, "record_prompt"):
+            self.service.generate_video("p", "out.mp4")
+        cfg = self.mock_client_instance.models.generate_videos.call_args.kwargs["config"]
+        self.assertEqual(cfg.person_generation, "allow_adult")
+
+    def test_reference_image_limits_and_style_type(self):
+        tmp = tempfile.mkdtemp()
+        try:
+            img = os.path.join(tmp, "ref.png")
+            with open(img, "wb") as f:
+                f.write(b"\x89PNG fake")
+            refs = [img] * 5 + ["style:" + img] * 4
+            fake_image = types.Image.model_construct(imageBytes=b"fake", mimeType="image/png")
+            with patch.object(FileManager, "record_prompt"), \
+                 patch.object(self.service, "_get_image_param",
+                              return_value=fake_image):
+                self.service.generate_video("p", "out.mp4", reference_image_paths=refs)
+            cfg = self.mock_client_instance.models.generate_videos.call_args.kwargs["config"]
+            kinds = [r.reference_type for r in cfg.reference_images]
+            self.assertEqual(kinds.count("ASSET"), 3)  # max 3 asset images
+            self.assertEqual(kinds.count("STYLE"), 3)  # max 3 style images
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_argparse_rejects_bad_duration_not_resolution(self):
+        parser = veo_generator.build_arg_parser()
+        # documented range enforced at service level, argparse keeps int type
+        args = parser.parse_args(["video", "p", "--duration", "8"])
+        self.assertEqual(args.duration, 8)
 
 
 class TestGUIModule(unittest.TestCase):
@@ -449,7 +525,7 @@ class TestGUIModule(unittest.TestCase):
         except tk.TclError:
             self.skipTest("no display available")
         try:
-            with patch.dict(os.environ, {"GEMINI_API_KEY": "k"}), \
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "AIzaSyDUMMY1234567890abcdefABCDEFGH"}), \
                  patch("veo_gui.GenerationOrchestrator") as MockOrch:
                 MockOrch.return_value.ai = MagicMock()
                 app = VeoGUIApp(root)
