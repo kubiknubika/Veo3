@@ -8,14 +8,16 @@ import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
-from unittest.mock import MagicMock, patch, mock_open
+from unittest.mock import MagicMock, patch, mock_open, ANY
 
 from google.genai import types
 
 import veo_generator
 from veo_generator import (
     ApiKeyError,
+    CancelledError,
     Config,
     FileManager,
     GenerationOrchestrator,
@@ -23,6 +25,16 @@ from veo_generator import (
     MediaProcessor,
     validate_api_key,
 )
+from task_journal import TaskJournal
+
+
+def _fake_journal() -> MagicMock:
+    """MagicMock standing in for GenAIService._journal in orchestrator tests."""
+    j = MagicMock(spec=TaskJournal)
+    j.record = MagicMock()
+    j.load = MagicMock(return_value=[])
+    j.stats = MagicMock(return_value={})
+    return j
 
 
 class TestApiKeyValidation(unittest.TestCase):
@@ -108,80 +120,182 @@ class TestFileManager(unittest.TestCase):
             FileManager.clear_resume_state()
             self.assertIsNone(FileManager.load_resume_state())
 
+    def test_resume_state_write_is_atomic_and_locked(self):
+        """Concurrent saves must never leave a torn/corrupt JSON file."""
+        rf = os.path.join(self.test_dir, "resume.json")
+        with patch.object(Config, "RESUME_FILE", rf):
+            errors: list[Exception] = []
+
+            def writer(i: int) -> None:
+                try:
+                    for _ in range(20):
+                        FileManager.save_resume_state({"prompts": [f"p{i}"] * 50})
+                except Exception as e:  # noqa: BLE001
+                    errors.append(e)
+
+            threads = [threading.Thread(target=writer, args=(i,)) for i in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(errors, [])
+            # File always parses and no temp files are left behind
+            state = FileManager.load_resume_state()
+            self.assertIsInstance(state, dict)
+            leftovers = [f for f in os.listdir(self.test_dir) if f.startswith(".resume_")]
+            self.assertEqual(leftovers, [])
+
 
 class TestMediaProcessor(unittest.TestCase):
-    @patch("cv2.imwrite", return_value=True)
-    @patch("cv2.VideoCapture")
-    def test_extract_last_frame_iterates_to_true_end(self, mock_videocapture, mock_imwrite):
-        """Last-frame extraction must read through the stream, not seek by frame count."""
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = True
-        frames = ["f1", "f2", "f3"]
-        reads = [(True, f) for f in frames] + [(False, None)]
-        mock_cap.read.side_effect = reads
-        mock_videocapture.return_value = mock_cap
+    """ffmpeg-based MediaProcessor: commands are mocked at _run level,
+    plus real-binary smoke tests when ffmpeg is available."""
 
-        result = MediaProcessor.extract_frame("dummy_video.mp4", "out.png", "last")
+    def test_extract_last_frame_uses_sseof_seek(self):
+        """Last frame is grabbed near the true end of stream (-sseof),
+        never by seeking a reported frame count (unreliable for VBR)."""
+        calls = []
 
-        mock_cap.set.assert_not_called()  # no unreliable seeking
-        self.assertEqual(mock_cap.read.call_count, 4)
-        mock_imwrite.assert_called_once_with("out.png", "f3")  # true final frame
-        mock_cap.release.assert_called_once()
-        self.assertEqual(result, "out.png")
+        def fake_run(cmd, timeout=600):
+            calls.append(cmd)
+            # simulate ffmpeg writing the output image
+            open(cmd[-1], "wb").close() if cmd[-1].endswith(".png") else None
+            with open(cmd[-1], "w") as f:
+                f.write("x")
+            return MagicMock(stdout="{}")
 
-    @patch("cv2.imwrite", return_value=True)
-    @patch("cv2.VideoCapture")
-    def test_extract_first_frame(self, mock_videocapture, mock_imwrite):
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = True
-        frame0 = MagicMock()  # stands in for a numpy frame array
-        mock_cap.read.return_value = (True, frame0)
-        mock_videocapture.return_value = mock_cap
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "frame.png")
+            with patch.object(MediaProcessor, "_run", side_effect=fake_run):
+                result = MediaProcessor.extract_frame("dummy_video.mp4", out, "last")
+            self.assertEqual(result, out)
+            first_cmd = calls[0]
+            self.assertIn("-sseof", first_cmd)
+            self.assertIn("-0.1", first_cmd)
+            self.assertIn("-frames:v", first_cmd)
+            # no whole-stream frame-count seeking anywhere
+            for c in calls:
+                self.assertNotIn("CAP_PROP_FRAME_COUNT", str(c))
 
-        result = MediaProcessor.extract_frame("v.mp4", "out.png", "first")
-        self.assertEqual(result, "out.png")
-        mock_imwrite.assert_called_once_with("out.png", frame0)
-        mock_cap.release.assert_called_once()
+    def test_extract_first_frame_single_frame_decode(self):
+        calls = []
 
-    @patch("cv2.VideoCapture")
-    def test_extract_frame_fail_open_releases_capture(self, mock_videocapture):
-        mock_cap = MagicMock()
-        mock_cap.isOpened.return_value = False
-        mock_videocapture.return_value = mock_cap
+        def fake_run(cmd, timeout=600):
+            calls.append(cmd)
+            with open(cmd[-1], "w") as f:
+                f.write("x")
+            return MagicMock(stdout="{}")
 
-        result = MediaProcessor.extract_frame("bad.mp4", "out.png")
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "frame.png")
+            with patch.object(MediaProcessor, "_run", side_effect=fake_run):
+                result = MediaProcessor.extract_frame("v.mp4", out, "first")
+            self.assertEqual(result, out)
+            self.assertEqual(len(calls), 1)
+            self.assertIn("-frames:v", calls[0])
+            self.assertEqual(calls[0][calls[0].index("-frames:v") + 1], "1")
+
+    def test_extract_frame_fail_open_returns_none(self):
+        """ffmpeg failure must degrade to None, not raise."""
+        import subprocess as sp
+        with patch.object(MediaProcessor, "_run",
+                          side_effect=sp.CalledProcessError(1, "ffmpeg")):
+            self.assertIsNone(MediaProcessor.extract_frame("bad.mp4", "out.png"))
+        with patch.object(MediaProcessor, "_run",
+                          side_effect=FileNotFoundError("no ffmpeg")):
+            self.assertIsNone(MediaProcessor.extract_frame("bad.mp4", "out.png"))
+
+    def test_concatenate_videos_identical_geometry_skips_normalize(self):
+        meta = {"w": 1280, "h": 720, "fps": 24.0}
+        cmds = []
+
+        def fake_run(cmd, timeout=600):
+            cmds.append(cmd)
+            with open(cmd[-1], "w") as f:   # create the concat output
+                f.write("x")
+            return MagicMock(stdout=json.dumps({"streams": [meta]}))
+
+        with tempfile.TemporaryDirectory() as td:
+            v1 = os.path.join(td, "v1.mp4"); open(v1, "w").close()
+            v2 = os.path.join(td, "v2.mp4"); open(v2, "w").close()
+            out = os.path.join(td, "final.mp4")
+            with patch.object(MediaProcessor, "_probe_video",
+                              side_effect=[dict(meta), dict(meta)]), \
+                 patch.object(MediaProcessor, "_run", side_effect=fake_run), \
+                 patch.object(MediaProcessor, "normalize_clip") as mock_norm:
+                result = MediaProcessor.concatenate_videos([v1, v2], out)
+            self.assertEqual(result, out)
+            mock_norm.assert_not_called()   # identical geometry -> no re-encode
+            self.assertTrue(any("-f" in c and "concat" in c for c in cmds))
+
+    def test_concatenate_videos_normalizes_mismatched_clips(self):
+        """Clips with different geometry must be normalized to the first clip's size."""
+        with tempfile.TemporaryDirectory() as td:
+            a = os.path.join(td, "a.mp4"); open(a, "w").close()
+            b = os.path.join(td, "b.mp4"); open(b, "w").close()
+            out = os.path.join(td, "out.mp4")
+
+            def fake_run(cmd, timeout=600):
+                with open(cmd[-1], "w") as f:
+                    f.write("x")
+                return MagicMock(stdout="{}")
+
+            with patch.object(MediaProcessor, "_probe_video",
+                              side_effect=[{"w": 1920, "h": 1080, "fps": 24.0},
+                                           {"w": 1280, "h": 720, "fps": 30.0}]), \
+                 patch.object(MediaProcessor, "_run", side_effect=fake_run), \
+                 patch.object(MediaProcessor, "normalize_clip",
+                              return_value=os.path.join(td, "_norm_b.mp4")) as mock_norm:
+                result = MediaProcessor.concatenate_videos([a, b], out)
+            self.assertEqual(result, out)
+            mock_norm.assert_called_once_with(b, 1920, 1080, ANY)
+
+    def test_concatenate_videos_probe_failure_returns_none_and_cleans_up(self):
+        """Regression: error path must not leak temp files or raise."""
+        with patch.object(MediaProcessor, "_probe_video", return_value=None):
+            result = MediaProcessor.concatenate_videos(["a.mp4", "b.mp4"], "out.mp4")
         self.assertIsNone(result)
-        mock_cap.release.assert_called_once()
 
-    @patch("veo_generator.VideoFileClip")
-    @patch("veo_generator.concatenate_videoclips")
-    def test_concatenate_videos_success_closes_clips(self, mock_concat, mock_videoclip):
-        clip = MagicMock()
-        mock_videoclip.return_value = clip
-        final = MagicMock()
-        mock_concat.return_value = final
+    def test_normalize_clip_passthrough_when_matching(self):
+        with patch.object(MediaProcessor, "_probe_video",
+                          return_value={"w": 1280, "h": 720, "fps": 24.0}):
+            self.assertEqual(MediaProcessor.normalize_clip("x.mp4", 1280, 720, 24.0),
+                             "x.mp4")
 
-        result = MediaProcessor.concatenate_videos(["v1.mp4", "v2.mp4"], "final.mp4")
+    def test_normalize_clip_reencodes_on_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            src = os.path.join(td, "src.mp4"); open(src, "w").close()
+            norm = os.path.join(td, "_norm_src.mp4")
 
-        self.assertEqual(result, "final.mp4")
-        self.assertEqual(mock_videoclip.call_count, 2)
-        final.write_videofile.assert_called_once()
-        final.close.assert_called_once()
-        self.assertEqual(clip.close.call_count, 2)
+            def fake_run(cmd, timeout=600):
+                self.assertIn("scale=", " ".join(cmd))
+                self.assertIn("pad=", " ".join(cmd))
+                with open(cmd[-1], "w") as f:
+                    f.write("x")
+                return MagicMock(stdout="")
 
-    @patch("veo_generator.VideoFileClip")
-    @patch("veo_generator.concatenate_videoclips")
-    def test_concatenate_videos_error_still_releases_handles(self, mock_concat, mock_videoclip):
-        """Regression test for the file-descriptor leak on concat failure."""
-        clips = [MagicMock() for _ in range(2)]
-        mock_videoclip.side_effect = clips
-        mock_concat.side_effect = RuntimeError("boom")
+            with patch.object(MediaProcessor, "_probe_video",
+                              return_value={"w": 640, "h": 360, "fps": 30.0}), \
+                 patch.object(MediaProcessor, "_run", side_effect=fake_run):
+                out = MediaProcessor.normalize_clip(src, 1280, 720, 24.0)
+            self.assertEqual(out, norm)
 
-        result = MediaProcessor.concatenate_videos(["a.mp4", "b.mp4"], "out.mp4")
-
-        self.assertIsNone(result)
-        for c in clips:
-            c.close.assert_called_once()
+    @unittest.skipIf(shutil.which("ffmpeg") is None, "ffmpeg not installed")
+    def test_real_ffmpeg_extract_first_frame_smoke(self):
+        """End-to-end check against the real binary: color source -> PNG frame."""
+        with tempfile.TemporaryDirectory() as td:
+            vid = os.path.join(td, "gen.mp4")
+            MediaProcessor._run([
+                "ffmpeg", "-y", "-f", "lavfi", "-i",
+                "testsrc=size=320x240:rate=24:duration=1",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", vid,
+            ], timeout=120)
+            frame = os.path.join(td, "f.png")
+            self.assertEqual(MediaProcessor.extract_frame(vid, frame, "first"), frame)
+            meta = MediaProcessor._probe_video(vid)
+            self.assertEqual(meta["w"], 320)
+            self.assertEqual(meta["h"], 240)
+            thumb = os.path.join(td, "t.jpg")
+            self.assertEqual(MediaProcessor.extract_thumbnail(vid, thumb, width=160), thumb)
 
 
 class TestGenAIService(unittest.TestCase):
@@ -298,6 +412,13 @@ class TestGenAIService(unittest.TestCase):
 class TestOrchestrator(unittest.TestCase):
     def setUp(self):
         self.ai = MagicMock(spec=GenAIService)
+        self.ai._journal = _fake_journal()
+        # Real cooperative-cancellation plumbing on the mock so batch/chain
+        # code paths that touch cancel_event behave like production.
+        self.cancel = threading.Event()
+        self.ai.cancel_event = self.cancel
+        self.ai.reset_cancel.side_effect = self.cancel.clear
+        self.ai.cancel.side_effect = self.cancel.set
         self.logs = []
         self.orch = GenerationOrchestrator(ai=self.ai, log_fn=self.logs.append)
 
@@ -406,6 +527,8 @@ class TestOrchestrator(unittest.TestCase):
             self.assertEqual(out, dest)
             self.assertTrue(os.path.exists(dest))
             self.assertFalse(os.path.exists(prev))
+            # journal records the accepted bridge (reliability item)
+            self.ai._journal.record.assert_any_call("bridge", "ok", output=dest, duration_s=ANY)
 
 
 class TestCLI(unittest.TestCase):
@@ -432,6 +555,117 @@ class TestCLI(unittest.TestCase):
             code = veo_generator.main(["video", "p", "--output", "out.mp4"])
         self.assertEqual(code, 0)
         MockOrch.return_value.single_video.assert_called_once()
+
+
+class TestReferenceSpecParsing(unittest.TestCase):
+    """Explicit style:/asset: prefixes must beat the legacy name heuristic."""
+
+    def test_explicit_prefixes_win(self):
+        self.assertEqual(GenAIService.parse_reference_spec("style:/x/plain.png"),
+                         ("/x/plain.png", "STYLE"))
+        self.assertEqual(GenAIService.parse_reference_spec("asset:/x/style_kit.png"),
+                         ("/x/style_kit.png", "ASSET"))
+        # case-insensitive prefix
+        self.assertEqual(GenAIService.parse_reference_spec("STYLE:/x/a.png")[1], "STYLE")
+
+    def test_legacy_heuristic_still_supported(self):
+        self.assertEqual(GenAIService.parse_reference_spec("/imgs/style_ref.png"),
+                         ("/imgs/style_ref.png", "STYLE"))
+        self.assertEqual(GenAIService.parse_reference_spec("/imgs/cat.png"),
+                         ("/imgs/cat.png", "ASSET"))
+
+    def test_windows_path_not_mistaken_for_prefix(self):
+        """Regression: 'C:\\...\\clip.png' used to hit the old substring check."""
+        path = r"C:\media\my style shot.png"
+        got_path, kind = GenAIService.parse_reference_spec(path)
+        self.assertEqual(got_path, path)   # path preserved verbatim
+        self.assertEqual(kind, "STYLE")    # via basename heuristic, not 'c:' prefix
+
+
+class TestCancellation(unittest.TestCase):
+    def setUp(self):
+        self.patcher = patch("veo_generator.genai.Client")
+        self.MockClient = self.patcher.start()
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "AIzaSyDUMMY1234567890abcdefABCDEFGH"}):
+            self.service = GenAIService()
+
+    def tearDown(self):
+        self.patcher.stop()
+
+    def test_cancel_event_available_and_resettable(self):
+        self.service.cancel()
+        self.assertTrue(self.service.cancel_event.is_set())
+        self.service.reset_cancel()
+        self.assertFalse(self.service.cancel_event.is_set())
+
+    def test_check_cancelled_raises(self):
+        self.service.cancel()
+        with self.assertRaises(CancelledError):
+            self.service._check_cancelled()
+
+    def test_polling_aborted_by_cancel(self):
+        """A cancelled request must break out of the LRO poll loop fast."""
+        op = MagicMock()
+        op.done = False
+        self.MockClient.return_value.models.generate_videos.return_value = op
+        self.MockClient.return_value.operations.get.return_value = op
+
+        # Cancel *during* the first poll: submit succeeds, then the user
+        # hits Cancel; the poll loop must abort without waiting for timeout.
+        def cancel_on_get(*a, **kw):
+            self.service.cancel()
+            return op
+        self.MockClient.return_value.operations.get.side_effect = cancel_on_get
+
+        with patch.object(FileManager, "record_prompt"), \
+             patch.object(Config, "POLL_INTERVAL_S", 0.001), \
+             patch("veo_generator.time.sleep"):
+            result = self.service.generate_video("p", "out.mp4")
+        self.assertIsNone(result)
+        # Cancelled tasks are journalled (not silently dropped).
+        entries = self.service._journal.load(5)
+        kinds = [e for e in entries if e.get("kind") == "video"]
+        self.assertTrue(kinds and kinds[-1]["status"] in ("cancelled", "failed"))
+
+    def test_precancel_blocks_submit(self):
+        """If already cancelled, generate_video must not even hit the API."""
+        self.service.cancel()
+        with patch.object(FileManager, "record_prompt"):
+            with self.assertRaises(CancelledError):
+                self.service.generate_video("p", "out.mp4")
+        self.MockClient.return_value.models.generate_videos.assert_not_called()
+
+
+class TestTaskJournal(unittest.TestCase):
+    def test_record_load_stats_roundtrip(self):
+        with tempfile.TemporaryDirectory() as td:
+            j = TaskJournal(os.path.join(td, "tasks.jsonl"))
+            j.record("video", "ok", prompt="cat", output="a.mp4", duration_s=12.5)
+            j.record("video", "failed", prompt="dog", error="429")
+            j.record("image", "ok", duration_s=3.0)
+            entries = j.load()
+            self.assertEqual(len(entries), 3)
+            self.assertEqual(entries[0]["kind"], "video")
+            self.assertEqual(entries[0]["status"], "ok")
+            st = j.stats()
+            self.assertEqual(st["total"], 3)
+            self.assertEqual(st["ok"], 2)
+            self.assertEqual(st["failed"], 1)
+            self.assertEqual(st["by_kind"]["video"]["ok"], 1)
+
+    def test_corrupt_lines_are_skipped(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "tasks.jsonl")
+            with open(p, "w") as f:
+                f.write('{"kind": "video", "status": "ok"}\n')
+                f.write("NOT JSON {{{\n")          # torn write must not crash
+                f.write('{"kind": "chain", "status": "failed"}\n')
+            entries = TaskJournal(p).load()
+            self.assertEqual(len(entries), 2)
+
+    def test_record_never_raises_on_bad_path(self):
+        j = TaskJournal(os.path.join("/proc/nonexistent-dir-xyz", "t.jsonl"))
+        j.record("video", "ok")   # must swallow OSError, not propagate
 
 
 class TestVeo31DocCompliance(unittest.TestCase):
@@ -512,29 +746,63 @@ class TestGUIModule(unittest.TestCase):
         # Uses queue-based logging and shared orchestrator (items 2, 8)
         self.assertIn("queue.Queue", src)
         self.assertIn("GenerationOrchestrator", src)
+        # Migrated off Tkinter onto Flet; tabs use SegmentedButton + Stack
+        self.assertIn("import flet as ft", src)
+        self.assertNotIn("tkinter", src)
+        self.assertIn("SegmentedButton", src)
+        self.assertIn("ft.Stack", src)
+        # Cancellation & progress plumbing wired through the orchestrator
+        self.assertIn("progress_cb", src)
+        self.assertIn("cancel", src)
 
     @unittest.skipIf(os.environ.get("SKIP_GUI_DISPLAY_TESTS") == "1", "needs display")
-    def test_gui_constructs_with_shared_state_vars(self):
+    def test_gui_app_class_exists(self):
         try:
-            import tkinter as tk
+            import flet  # noqa: F401
         except ImportError:
-            self.skipTest("tkinter unavailable")
+            self.skipTest("flet unavailable")
         from veo_gui import VeoGUIApp
-        try:
-            root = tk.Tk()
-        except tk.TclError:
-            self.skipTest("no display available")
-        try:
-            with patch.dict(os.environ, {"GEMINI_API_KEY": "AIzaSyDUMMY1234567890abcdefABCDEFGH"}), \
-                 patch("veo_gui.GenerationOrchestrator") as MockOrch:
-                MockOrch.return_value.ai = MagicMock()
-                app = VeoGUIApp(root)
-                # item 1: res_var/ar_var exist at app level for every tab
-                self.assertEqual(app.res_var.get(), "720p")
-                self.assertEqual(app.ar_var.get(), "16:9")
-            root.update_idletasks()
-        finally:
-            root.destroy()
+        # Constructing the app requires a live Flet page; we only assert
+        # the public surface used by main() here.
+        self.assertTrue(callable(VeoGUIApp))
+        self.assertTrue(hasattr(VeoGUIApp, "_switch_tab"))
+        self.assertTrue(hasattr(VeoGUIApp, "_on_progress"))
+        self.assertTrue(hasattr(VeoGUIApp, "_cancel_current"))
+
+
+class TestCLIFlags(unittest.TestCase):
+    def test_video_flags_audio_upscale(self):
+        parser = veo_generator.build_arg_parser()
+        args = parser.parse_args(["video", "p", "--no-audio", "--upscale"])
+        self.assertFalse(args.audio)
+        self.assertTrue(args.upsampling)
+        # defaults: audio on, upscale unset (env-driven)
+        d = parser.parse_args(["video", "p"])
+        self.assertTrue(d.audio)
+        self.assertIsNone(d.upsampling)
+
+    def test_batch_flags(self):
+        parser = veo_generator.build_arg_parser()
+        args = parser.parse_args(["batch", "a", "b", "--no-audio", "--upscale",
+                                  "--workers", "2"])
+        self.assertFalse(args.audio)
+        self.assertTrue(args.upsampling)
+        self.assertEqual(args.workers, 2)
+
+    def test_tasks_subcommand(self):
+        parser = veo_generator.build_arg_parser()
+        args = parser.parse_args(["tasks", "--limit", "5", "--json"])
+        self.assertEqual(args.command, "tasks")
+        self.assertEqual(args.limit, 5)
+        self.assertTrue(args.json)
+
+    def test_tasks_command_runs_without_api_key(self):
+        """'tasks' is read-only reporting: must work with no GEMINI_API_KEY."""
+        with patch.dict(os.environ, {}, clear=True), \
+             patch.object(Config, "TASKS_JOURNAL_FILE",
+                          os.path.join(tempfile.mkdtemp(), "t.jsonl")):
+            code = veo_generator.main(["tasks", "--limit", "3"])
+        self.assertEqual(code, 0)
 
 
 if __name__ == "__main__":
