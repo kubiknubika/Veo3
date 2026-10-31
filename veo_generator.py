@@ -128,6 +128,40 @@ _DEFAULT_TEMPLATES: dict[str, str] = {
 }
 
 
+class GenerationError(RuntimeError):
+    """Raised by GenAIService when a generation request definitively fails.
+
+    Carries an already human-readable message (see :func:`_friendly_api_error`)
+    so frontends can show the *reason* instead of a generic "failed".
+    """
+
+
+class _GuiLogBridge:
+    """Context-local sink that forwards core-module logs into the GUI console."""
+
+    def __init__(self) -> None:
+        self._fn: Optional[Callable[[str], None]] = None
+
+    def bind(self, fn: Optional[Callable[[str], None]]) -> None:
+        self._fn = fn
+
+    def emit(self, message: str) -> None:
+        fn = self._fn
+        if fn is not None:
+            try:
+                fn(message)
+            except Exception:  # noqa: BLE001 - logging must never break work
+                pass
+
+
+_log_to_gui = _GuiLogBridge()
+
+
+def set_gui_logger(fn: Optional[Callable[[str], None]]) -> None:
+    """Register (or clear) a callable receiving core log lines for the GUI."""
+    _log_to_gui.bind(fn)
+
+
 class ApiKeyError(RuntimeError):
     """Raised when the GEMINI_API_KEY is missing or obviously invalid."""
 
@@ -217,6 +251,100 @@ def check_api_key_connectivity(key: str, timeout_s: float = 15.0) -> tuple[bool,
         return False, msg or f"Ошибка HTTP {e.code}."
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         return False, f"Нет связи с Google API: {getattr(e, 'reason', e)}"
+
+
+def check_veo_access(key: Optional[str] = None, timeout_s: float = 15.0) -> tuple[bool, list]:
+    """Diagnose whether ``key`` can actually use Veo video generation.
+
+    Three cheap REST probes (no model inference — zero generation quota):
+      1. key validity          — GET /v1beta/models
+      2. Veo model visibility  — GET /v1beta/models/<video model>
+      3. Gemini text model     — GET /v1beta/models/<text model> (needed for
+                                 auto negative-prompt / prompt expansion)
+
+    Returns ``(ok, lines)`` where *lines* is a human-readable checklist;
+    never raises.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    key = get_api_key() if key is None else (key or "").strip()
+    lines: list[str] = []
+    if not key:
+        return False, ["✗ Ключ не задан — вставьте его в окне «API Key»."]
+
+    def _get(url: str) -> tuple[Optional[int], dict]:
+        req = urllib.request.Request(url, headers={"User-Agent": "Veo3ProGenerator"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                status = resp.status
+                body = resp.read(65536).decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            status = e.code
+            try:
+                body = e.read().decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001
+                body = ""
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            return None, {"message": f"нет связи с Google API: {getattr(e, 'reason', e)}"}
+        try:
+            data = _json.loads(body or "{}")
+        except ValueError:
+            data = {"raw": body[:200]}
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"]
+            return status, {"message": str(err.get("message") or err),
+                            "status": err.get("status", "")}
+        return status, data
+
+    base = "https://generativelanguage.googleapis.com/v1beta/models/"
+
+    # 1) Is the key accepted at all?
+    st, data = _get(base + "?" + urllib.parse.urlencode({"pageSize": "1", "key": key}))
+    if st is None:
+        return False, [f"✗ Сеть: {data.get('message')}",
+                       "Проверьте интернет-соединение / прокси / антивирус."]
+    if st in (400, 401, 403) or data.get("message", "").lower().startswith("api key"):
+        return False, [f"✗ Ключ отклонён Google (HTTP {st}): {data.get('message')}",
+                       "Скопируйте ключ целиком из https://aistudio.google.com/apikey"]
+    if st != 200:
+        return False, [f"✗ Неожиданный ответ API (HTTP {st}): {data.get('message', '')}"]
+    lines.append(f"✓ Ключ принят Google API (HTTP {st})")
+
+    # 2) Does this key/project see the Veo video model?
+    st, data = _get(base + urllib.parse.quote(Config.MODEL_VIDEO, safe="") +
+                    "?" + urllib.parse.urlencode({"key": key}))
+    if st == 200 and isinstance(data, dict) and data.get("name"):
+        methods = data.get("supportedGenerationMethods") or []
+        if "generateVideos" in methods:
+            lines.append(f"✓ Модель {Config.MODEL_VIDEO} доступна и поддерживает generateVideos")
+        else:
+            lines.append(f"⚠ Модель {Config.MODEL_VIDEO} найдена, но supportedGenerationMethods"
+                         f" = {methods or 'пусто'} — генерация видео может быть недоступна")
+    elif st in (403, 404):
+        lines.append(f"✗ Модель {Config.MODEL_VIDEO}: HTTP {st} — "
+                     f"{data.get('message', 'доступ запрещён / модель не найдена')}")
+        if st == 404:
+            lines.append("   → проверьте значение VEO_MODEL_VIDEO в .env "
+                         "(например veo-3.1-generate-001)")
+        else:
+            lines.append("   → Veo требует платного тарифа (billing включён на проекте ключа)")
+    else:
+        lines.append(f"⚠ Модель {Config.MODEL_VIDEO}: HTTP {st} — {data.get('message', '')}")
+
+    # 3) Text model (used for auto-negative-prompt / prompt expansion)
+    st, data = _get(base + urllib.parse.quote(Config.MODEL_TEXT, safe="") +
+                    "?" + urllib.parse.urlencode({"key": key}))
+    if st == 200:
+        lines.append(f"✓ Модель {Config.MODEL_TEXT} доступна (негативные промпты / расширение)")
+    else:
+        lines.append(f"⚠ Модель {Config.MODEL_TEXT}: HTTP {st} — {data.get('message', '')} "
+                     "(автонегатив будет пропущен)")
+
+    ok = any(ln.startswith("✓ Модель") and Config.MODEL_VIDEO in ln for ln in lines)
+    return ok, lines
 
 
 def set_api_key(key: str, persist: bool = True) -> str:
@@ -701,6 +829,12 @@ class GenAIService:
         self.cancel_event: threading.Event = threading.Event()
         # JSONL task journal (statistics / observability).
         self._journal = TaskJournal(Config.TASKS_JOURNAL_FILE)
+        # Human-readable reason of the most recent failed generation.
+        self.last_error: Optional[str] = None
+
+    def check_veo_access(self, key: Optional[str] = None) -> tuple[bool, list]:
+        """Run the offline-friendly Veo access diagnostic for a key."""
+        return check_veo_access(key if key is not None else get_api_key())
 
     @property
     def has_api_key(self) -> bool:
@@ -768,8 +902,17 @@ class GenAIService:
         """
         start = time.time()
         last_pct: Optional[int] = None
+        last_note = start
         while not getattr(operation, "done", False):
             self._check_cancelled()
+            now = time.time()
+            if now - last_note >= 60:
+                last_note = now
+                note = f"{last_pct}%" if last_pct is not None else "без прогресса"
+                _log_to_gui.emit(f"[API] Veo генерирует... {now - start:.0f} с "
+                                 f"(прогресс: {note})")
+                logger.info("Still waiting for operation: %.0fs elapsed (%s)",
+                            now - start, note)
             if time.time() - start > Config.POLL_TIMEOUT_S:
                 raise TimeoutError(f"Generation exceeded {Config.POLL_TIMEOUT_S:.0f}s timeout.")
             meta = getattr(operation, "metadata", None)
@@ -815,9 +958,13 @@ class GenAIService:
                 "watermark, text, ugly, distorted. Return ONLY the keywords."
             )
             resp = self._ensure_client().models.generate_content(model=Config.MODEL_TEXT, contents=prompt)
-            return resp.text.strip()
+            result = resp.text.strip()
+            _log_to_gui.emit(f"[LLM] Негативный промпт готов ({len(result)} симв.).")
+            return result
         except Exception as e:  # noqa: BLE001
-            logger.warning("Negative prompt generation failed: %s", e)
+            logger.warning("Negative prompt generation failed: %s", e, exc_info=True)
+            _log_to_gui.emit(f"[LLM] Авто-негатив недоступен: {_friendly_api_error(e)} "
+                             "(генерация продолжена без него — это НЕ причина отказа видео)")
             return None
 
     def expand_prompt(self, short_prompt: str) -> Optional[str]:
@@ -832,7 +979,8 @@ class GenAIService:
             resp = self._ensure_client().models.generate_content(model=Config.MODEL_TEXT, contents=meta)
             return resp.text.strip()
         except Exception as e:  # noqa: BLE001
-            logger.warning("Prompt expansion failed: %s", e)
+            logger.warning("Prompt expansion failed: %s", e, exc_info=True)
+            _log_to_gui.emit(f"[LLM] Расширение промпта недоступно: {_friendly_api_error(e)}")
             return None
 
     # ---- generation ----
@@ -869,6 +1017,7 @@ class GenAIService:
         reference_image_paths: Optional[list[str]] = None,
         upsampling: Optional[bool] = None,
         progress_cb: Optional[Callable[[Optional[int]], None]] = None,
+        log_fn: Optional[Callable[[str], None]] = None,
     ) -> Optional[str]:
         """Generate a single Veo clip. Returns the output path or ``None``.
 
@@ -878,6 +1027,11 @@ class GenAIService:
         * reference images: ASSET up to 3, STYLE up to 3 per request;
         * upsampling: Veo 3.1 native 1080p/4k upscale pass (paid tier).
         """
+        if log_fn is None:
+            log_fn = _log_to_gui.get()
+        if log_fn:
+            log_fn(f"[API] Запрос Veo: модель={Config.MODEL_VIDEO}, {resolution}, "
+                   f"{aspect_ratio}, audio={generate_audio}, upscale={upsampling!r}")
         logger.info("Generating video: '%s' [%s, %s]", prompt, resolution, aspect_ratio)
         FileManager.record_prompt(prompt, "video", output_filename)
         self._check_cancelled()
@@ -944,6 +1098,8 @@ class GenAIService:
                     config_params["last_frame"] = last_frame_param
 
             def submit(cfg_params: dict):
+                _log_to_gui.emit(f"[API] Отправка запроса generate_videos "
+                                 f"(параметры: {sorted(cfg_params.keys())})...")
                 cfg = types.GenerateVideosConfig(**cfg_params)
                 return self._ensure_client().models.generate_videos(
                     model=Config.MODEL_VIDEO,
@@ -984,7 +1140,15 @@ class GenAIService:
             generated_video = videos[0]
             self._ensure_client().files.download(file=generated_video.video)
             generated_video.video.save(output_filename)
-            logger.info("Video saved: %s", output_filename)
+            self.last_error = None
+            try:
+                size_mb = os.path.getsize(output_filename) / 1e6
+            except OSError:
+                size_mb = 0.0
+            logger.info("Video saved: %s (%.2f MB)", output_filename, size_mb)
+            if log_fn:
+                log_fn(f"[API] Видео сохранено: {output_filename} ({size_mb:.2f} МБ, "
+                       f"{time.time() - start:.0f} с)")
             self._journal.record("video", "ok", prompt=prompt, output=output_filename,
                                  duration_s=time.time() - start,
                                  extra={"resolution": resolution, "upscaled": bool(use_upscale)})
@@ -1002,10 +1166,13 @@ class GenAIService:
             raise
         except Exception as e:  # noqa: BLE001
             friendly = _friendly_api_error(e)
-            logger.error("Video generation failed: %s\n%s", e, friendly)
+            logger.error("Video generation failed: %s\n%s", e, friendly, exc_info=True)
+            self.last_error = friendly
+            if log_fn:
+                log_fn(f"[API] Ошибка генерации видео: {friendly}")
             self._journal.record("video", "failed", prompt=prompt, error=friendly,
                                  duration_s=time.time() - start)
-            return None
+            raise GenerationError(friendly) from e
 
     def generate_image(self, prompt: str, output_filename: str) -> Optional[str]:
         logger.info("Generating image: '%s'", prompt)
@@ -1026,9 +1193,12 @@ class GenAIService:
                     self._journal.record("image", "ok", prompt=prompt, output=output_filename,
                                          duration_s=time.time() - start)
                     return output_filename
-            logger.error("No image returned in response parts.")
-            self._journal.record("image", "failed", prompt=prompt, error="No image in response")
-            return None
+            msg = "Изображение не вернулось в ответе API (пустые parts)."
+            logger.error(msg)
+            _log_to_gui.emit(f"[API] {msg}")
+            self.last_error = msg
+            self._journal.record("image", "failed", prompt=prompt, error=msg)
+            raise GenerationError(msg)
         except CancelledError:
             self._journal.record("image", "failed", prompt=prompt, error="cancelled")
             raise
@@ -1037,9 +1207,12 @@ class GenAIService:
             self._journal.record("image", "failed", prompt=prompt, error="missing api key")
             raise
         except Exception as e:  # noqa: BLE001
-            logger.error("Image generation failed: %s", e)
-            self._journal.record("image", "failed", prompt=prompt, error=str(e))
-            return None
+            friendly = _friendly_api_error(e)
+            logger.error("Image generation failed: %s", e, exc_info=True)
+            _log_to_gui.emit(f"[API] Ошибка генерации изображения: {friendly}")
+            self.last_error = friendly
+            self._journal.record("image", "failed", prompt=prompt, error=friendly)
+            raise GenerationError(friendly) from e
 
     def generate_audio(
         self,
@@ -1133,9 +1306,12 @@ class GenAIService:
                 self._journal.record("audio", "ok", prompt=prompt, output=output_filename,
                                      duration_s=time.time() - start)
                 return output_filename
-            self._journal.record("audio", "failed", prompt=prompt, error="session returned no audio",
+            msg = "Lyria не вернула аудиопоток (нужен платный тариф для Live Music API)."
+            _log_to_gui.emit(f"[API] {msg}")
+            self.last_error = msg
+            self._journal.record("audio", "failed", prompt=prompt, error=msg,
                                  duration_s=time.time() - start)
-            return None
+            raise GenerationError(msg)
         except CancelledError:
             self._journal.record("audio", "failed", prompt=prompt, error="cancelled",
                                  duration_s=time.time() - start)
@@ -1146,10 +1322,13 @@ class GenAIService:
                                  duration_s=time.time() - start)
             raise
         except Exception as e:  # noqa: BLE001
-            logger.error("Audio generation launch failed: %s", e)
-            self._journal.record("audio", "failed", prompt=prompt, error=str(e),
+            friendly = _friendly_api_error(e)
+            logger.error("Audio generation launch failed: %s", e, exc_info=True)
+            _log_to_gui.emit(f"[API] Ошибка генерации аудио: {friendly}")
+            self.last_error = friendly
+            self._journal.record("audio", "failed", prompt=prompt, error=friendly,
                                  duration_s=time.time() - start)
-            return None
+            raise GenerationError(friendly) from e
 
 
 # --- Orchestrator: shared high-level flows for CLI and GUI ---
@@ -1262,10 +1441,21 @@ class GenerationOrchestrator:
         except CancelledError:
             status = "cancelled"
             raise
-        except Exception as e:  # noqa: BLE001 - surface a readable reason to the UI
+        except GenerationError as e:
+            # generate_video already logged + journaled the friendly reason.
             status = "failed"
             if on_error:
-                on_error(_friendly_api_error(e))
+                on_error(str(e))
+            self.log(f"Видео не создано: {e}")
+            return None
+        except Exception as e:  # noqa: BLE001 - surface a readable reason to the UI
+            status = "failed"
+            friendly = _friendly_api_error(e)
+            logger.error("single_video failed: %s", e, exc_info=True)
+            self.ai.last_error = friendly
+            if on_error:
+                on_error(friendly)
+            self.log(f"Видео не создалось: {friendly}")
             return None
         finally:
             self._report_progress(100 if out else None, "done" if out else "stopped")
@@ -1301,8 +1491,10 @@ class GenerationOrchestrator:
                 )
             except CancelledError:
                 self.log(f"Batch item {idx + 1} cancelled.")
-            except Exception as e:  # noqa: BLE001
+            except GenerationError as e:
                 self.log(f"Batch item {idx + 1} failed: {e}")
+            except Exception as e:  # noqa: BLE001
+                self.log(f"Batch item {idx + 1} failed: {_friendly_api_error(e)}")
             finally:
                 done_count["n"] += 1
                 self._report_progress(100 * done_count["n"] // len(prompts), f"batch {done_count['n']}/{len(prompts)}")
@@ -1351,7 +1543,13 @@ class GenerationOrchestrator:
         kwargs = dict(aspect_ratio=aspect_ratio, resolution=resolution, generate_audio=generate_audio,
                       upsampling=upsampling)
         self._report_progress(5, "segment 1/{}".format(total))
-        v = self.ai.generate_video(remaining.pop(0), first_name, image_path=start_image, **kwargs)
+        try:
+            v = self.ai.generate_video(remaining.pop(0), first_name, image_path=start_image, **kwargs)
+        except GenerationError as e:
+            self.log(f"Chain: сегмент 1/{total} не создан: {e}")
+            self.ai._journal.record("chain", "failed", prompt=f"1/{total}",
+                                    error=str(e), duration_s=time.time() - start)
+            return None
         if not v:
             self.log("First chain segment failed.")
             self.ai._journal.record("chain", "failed", prompt=f"1/{total}", duration_s=time.time() - start)
@@ -1385,6 +1583,9 @@ class GenerationOrchestrator:
                                                 image_path=last_frame_path, **kwargs)
             except CancelledError:
                 cancelled = True
+                v_next = None
+            except GenerationError as ge:
+                self.log(f"Chain: сегмент {i + 2} не создан: {ge}")
                 v_next = None
             if not v_next:
                 self.log(f"Segment {i + 2} failed; partial chain kept (state saved for resume).")
@@ -1497,8 +1698,12 @@ class GenerationOrchestrator:
             self.log("Generating initial Video 2...")
             self._report_progress(10, "video 2")
             v2_file = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "bridge_v2", ".mp4")
-            v = self.ai.generate_video(v2_prompt, v2_file, aspect_ratio=aspect_ratio, resolution=resolution,
-                                       generate_audio=generate_audio, upsampling=upsampling)
+            try:
+                v = self.ai.generate_video(v2_prompt, v2_file, aspect_ratio=aspect_ratio, resolution=resolution,
+                                           generate_audio=generate_audio, upsampling=upsampling)
+            except GenerationError as ge:
+                self.log(f"Bridge: не удалось создать Video 2: {ge}")
+                return None
             if not v:
                 return None
             state["v2_type"] = "generated"
@@ -1517,9 +1722,14 @@ class GenerationOrchestrator:
 
         b_prompt = bridge_prompt or "Smooth transition between the two scenes, cinematic"
         b_name = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "bridge_seg", ".mp4")
-        if not self.ai.generate_video(b_prompt, b_name, image_path=f1, last_frame_path=f2,
-                                      aspect_ratio=aspect_ratio, resolution=resolution,
-                                      generate_audio=generate_audio, upsampling=upsampling):
+        try:
+            ok_bridge = self.ai.generate_video(b_prompt, b_name, image_path=f1, last_frame_path=f2,
+                                               aspect_ratio=aspect_ratio, resolution=resolution,
+                                               generate_audio=generate_audio, upsampling=upsampling)
+        except GenerationError as ge:
+            self.log(f"Bridge: сегмент перехода не создан: {ge}")
+            ok_bridge = None
+        if not ok_bridge:
             self.log("Bridge generation failed.")
             FileManager.cleanup_files(state["temp_files"])
             return None
@@ -1565,11 +1775,15 @@ class GenerationOrchestrator:
             return None
 
         new_v2 = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "v2_regen", ".mp4")
-        v = self.ai.generate_video(new_v2_prompt, new_v2, image_path=bridge_end_frame,
+        try:
+            v = self.ai.generate_video(new_v2_prompt, new_v2, image_path=bridge_end_frame,
                                    aspect_ratio=state.get("aspect_ratio", "16:9"),
                                    resolution=state.get("resolution", "720p"),
-                                   generate_audio=state.get("generate_audio", True),
-                                   upsampling=state.get("upsampling"))
+                                     generate_audio=state.get("generate_audio", True),
+                                     upsampling=state.get("upsampling"))
+        except GenerationError as ge:
+            self.log(f"Regeneration failed: {ge}; keeping previous Video 2.")
+            return None
         if not v:
             self.log("Regeneration failed; keeping previous Video 2.")
             return None
@@ -1810,7 +2024,12 @@ class VeoGeneratorApp:
     def handle_image_gen(self) -> None:
         p = input("Prompt: ")
         fname = FileManager.ask_for_filename("File name: ", "generated_image", Config.OUTPUT_DIRS["image"], ".png")
-        self.orch.ai.generate_image(p, fname)
+        try:
+            out = self.orch.ai.generate_image(p, fname)
+        except GenerationError as e:
+            print(f"Изображение не создано: {e}")
+            return
+        print(f"Result: {out}" if out else "No result.")
 
     def handle_audio_gen(self) -> None:
         p = input("Prompt: ")
@@ -1822,7 +2041,12 @@ class VeoGeneratorApp:
             except ValueError:
                 print("Invalid number; using 10.")
         fname = FileManager.ask_for_filename("File name: ", "audio", Config.OUTPUT_DIRS["audio"], ".wav")
-        self.orch.ai.generate_audio(p, sec, fname)
+        try:
+            out = self.orch.ai.generate_audio(p, sec, fname)
+        except GenerationError as e:
+            print(f"Аудио не создано: {e}")
+            return
+        print(f"Result: {out}" if out else "No result.")
 
     def handle_batch_mode(self) -> None:
         print("1. From prompt list\n2. Concatenate existing videos")
@@ -1994,6 +2218,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     bat.add_argument("--no-audio", dest="audio", action="store_false", default=True)
     bat.add_argument("--upscale", dest="upsampling", action="store_true", default=None)
 
+    chk = sub.add_parser("checkkey", help="test the API key and Veo access (no quota spent)")
+    chk.add_argument("--key", default=None, help="key to test (default: from env/.env)")
+
     tsk = sub.add_parser("tasks", help="show task journal / statistics")
     tsk.add_argument("--limit", type=int, default=20, help="how many recent tasks to print")
     tsk.add_argument("--json", action="store_true", help="machine-readable output")
@@ -2005,6 +2232,24 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     _setup_logging(getattr(args, "verbose", False))
+
+    if args.command == "checkkey":
+        # Live diagnostic — runs even when no key is configured yet.
+        key = args.key or get_api_key()
+        if not key:
+            print("GEMINI_API_KEY не задан (.env / переменная окружения пустые).\n"
+                  "Задайте: GEMINI_API_KEY=AIza... python veo_generator.py checkkey "
+                  "или вставьте ключ в окне GUI.", file=sys.stderr)
+            return 2
+        ok_k, msg = check_api_key_connectivity(key)
+        print(f"1) Связность ключа: {'OK' if ok_k else 'FAIL'} — {msg}")
+        ok_v, lines = check_veo_access(key)
+        for ln in lines:
+            print("   " + ln)
+        print("ИТОГ:", "Veo доступен для этого ключа ✓" if ok_v else
+              "Veo НЕдоступен — см. пункты выше (чаще всего нужен платный тариф "
+              "или другой VEO_MODEL_VIDEO)")
+        return 0 if ok_v else 1
 
     try:
         validate_api_key()
@@ -2035,10 +2280,18 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0 if out else 1
     if args.command == "image":
         fname = args.output or FileManager.get_unique_filename(Config.OUTPUT_DIRS["image"], "image", ".png")
-        return 0 if orch.ai.generate_image(args.prompt, fname) else 1
+        try:
+            return 0 if orch.ai.generate_image(args.prompt, fname) else 1
+        except GenerationError as e:
+            print(f"Image generation failed: {e}", file=sys.stderr)
+            return 1
     if args.command == "audio":
         fname = args.output or FileManager.get_unique_filename(Config.OUTPUT_DIRS["audio"], "music", ".wav")
-        return 0 if orch.ai.generate_audio(args.prompt, args.duration, fname) else 1
+        try:
+            return 0 if orch.ai.generate_audio(args.prompt, args.duration, fname) else 1
+        except GenerationError as e:
+            print(f"Audio generation failed: {e}", file=sys.stderr)
+            return 1
     if args.command == "batch":
         try:
             with open(args.prompts_file, "r", encoding="utf-8") as fh:
