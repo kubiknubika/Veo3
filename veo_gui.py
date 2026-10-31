@@ -241,8 +241,15 @@ class VeoGUIApp:
 
         def close(e=None) -> None:
             self._key_dlg_open = False
+            # Flet API compatibility for closing dialogs.
             try:
-                self.page.close(dlg)
+                if hasattr(self.page, "pop_dialog"):
+                    self.page.pop_dialog()
+                elif hasattr(self.page, "close"):
+                    self.page.close(dlg)
+                else:
+                    dlg.open = False
+                    self.page.update()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -313,10 +320,18 @@ class VeoGUIApp:
             ],
             actions_alignment=ft.MainAxisAlignment.END,
         )
-        try:
-            self.page.show(dlg)
-        except Exception:  # noqa: BLE001
+        # Flet API compatibility across versions.
+        # Flet >= 0.24: page.show_dialog(dlg)
+        # Flet 0.21-0.23: page.open(dlg)
+        # Older: page.dialog = dlg; page.update()
+        if hasattr(self.page, "show_dialog"):
+            self.page.show_dialog(dlg)
+        elif hasattr(self.page, "open"):
             self.page.open(dlg)
+        else:
+            self.page.dialog = dlg
+            dlg.open = True
+            self.page.update()
 
     def _run_key_check(self, e=None) -> None:
         """Header button: run the full connectivity + Veo-access diagnostic."""
