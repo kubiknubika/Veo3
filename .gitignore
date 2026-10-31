@@ -26,3 +26,5 @@ output/
 
 # Internal Documentation
 Documentation/
+build/
+dist/

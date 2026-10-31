@@ -50,6 +50,15 @@ Advanced AI Media Generation tool powered by Google Gemini (Veo 3.1, Imagen 4, L
 
 To use it **like an installed app**: right-click `VeoGUI.vbs` (or `run.bat`) → *Send to → Desktop (create shortcut)*, then rename the shortcut to "Veo3 Generator" and pin it to the taskbar/Start.
 
+**Standalone .exe (no Python needed on the target PC)** — build once on any Windows machine where you already ran `run.bat`:
+
+```powershell
+.venv\Scripts\pip install pyinstaller
+.venv\Scripts\pyinstaller veo.spec --clean --noconfirm
+```
+
+Result: `dist\VeoGenerator\` folder (~100–200 MB). Copy that folder + a `.env` file with your key anywhere; double-click `VeoGenerator.exe`. Videos still go to `output\` next to the exe. If SmartScreen warns on first run, click *More info → Run anyway* (the build is unsigned). Note: ffmpeg must be on PATH on the target PC (or drop `ffmpeg.exe` next to the app).
+
 For the command line use **`cli.bat`**:
 
 ```powershell
