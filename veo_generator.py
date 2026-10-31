@@ -1,7 +1,9 @@
 """Veo3 Pro Generator — core application module.
 
 Provides the shared orchestration layer used by both the CLI
-(``python -m veo_generator``) and the Tkinter GUI (``veo_gui.py``).
+(``python -m veo_generator``) and the Flet GUI (``veo_gui.py``).
+Media processing is done with ffmpeg/ffprobe subprocesses only — no
+OpenCV / NumPy / MoviePy dependencies.
 
 Features:
     * Text/Image-to-Video generation via Veo 3.1 (with polling, retries, backoff)
@@ -31,12 +33,9 @@ import wave
 from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
-import cv2
-import numpy as np
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
-from moviepy import VideoFileClip, concatenate_videoclips
 
 from task_journal import TaskJournal
 
@@ -299,85 +298,124 @@ class FileManager:
             logger.warning("Failed to clear resume state: %s", e)
 
 
-# --- Media Processing (OpenCV / MoviePy) ---
+# --- Media Processing (ffmpeg / ffprobe) ---
 
 
 class MediaProcessor:
-    """Frame extraction and video concatenation helpers."""
+    """Frame extraction, normalization and concatenation via ffmpeg.
+
+    All heavy video work is delegated to the ``ffmpeg``/``ffprobe``
+    binaries (subprocess), which keeps the dependency footprint small —
+    no OpenCV / NumPy / MoviePy required.
+    """
+
+    @staticmethod
+    def _run(cmd: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
+        """Run an ffmpeg/ffprobe command quietly; raise on failure."""
+        logger.debug("Running: %s", " ".join(cmd))
+        return subprocess.run(
+            cmd, capture_output=True, text=True, check=True, timeout=timeout
+        )
 
     @staticmethod
     def extract_frame(video_path: str, output_image_path: str, pos: str = "last") -> Optional[str]:
-        """Extract the first or last frame of a video.
+        """Extract the first or last frame of a video using ffmpeg.
 
-        For ``pos='last'`` this iterates to the true end of the file instead
-        of seeking by ``CAP_PROP_FRAME_COUNT``, which can fail on VBR/B-frame
-        streams where the reported frame count is inaccurate.
+        ``-sseof -0.1`` seeks near the true end of the stream (robust for
+        VBR/B-frame files where a reported frame count can be wrong); if
+        nothing is decoded there we fall back to scanning from the start
+        and keeping the final decoded frame.
         """
         logger.info("Extracting %s frame from %s...", pos, video_path)
-        cap = cv2.VideoCapture(video_path)
         try:
-            if not cap.isOpened():
-                logger.error("Could not open video %s", video_path)
-                return None
-
-            frame = None
             if pos == "last":
-                # Robust: iterate through the stream and keep the final frame.
-                while True:
-                    ret, candidate = cap.read()
-                    if not ret:
-                        break
-                    if candidate is not None:
-                        frame = candidate
-            else:  # first
-                ret, frame = cap.read()
-                if not ret:
-                    frame = None
-
-            if frame is not None:
-                if cv2.imwrite(output_image_path, frame):
+                # Fast path: seek 0.1s before the end, grab one frame.
+                try:
+                    MediaProcessor._run([
+                        "ffmpeg", "-y", "-sseof", "-0.1", "-i", video_path,
+                        "-map", "v:0", "-frames:v", "1", "-update", "1",
+                        "-q:v", "2", output_image_path,
+                    ], timeout=120)
+                    if os.path.exists(output_image_path) and os.path.getsize(output_image_path) > 0:
+                        return output_image_path
+                except subprocess.CalledProcessError:
+                    pass
+                # Fallback: decode whole stream, keep the final frame.
+                MediaProcessor._run([
+                    "ffmpeg", "-y", "-i", video_path,
+                    "-map", "v:0", "-vsync", "vfr", "-f", "null", os.devnull,
+                ])
+                tmpdir = tempfile.mkdtemp(prefix="veo_frames_")
+                try:
+                    MediaProcessor._run([
+                        "ffmpeg", "-y", "-i", video_path, "-map", "v:0",
+                        os.path.join(tmpdir, "f%08d.png"),
+                    ])
+                    frames = sorted(f for f in os.listdir(tmpdir) if f.endswith(".png"))
+                    if not frames:
+                        logger.error("No frames decoded from %s", video_path)
+                        return None
+                    shutil.copyfile(os.path.join(tmpdir, frames[-1]), output_image_path)
                     return output_image_path
-                logger.error("Failed to write frame image to %s", output_image_path)
-                return None
-            logger.error("Failed to read frame from %s", video_path)
+                finally:
+                    shutil.rmtree(tmpdir, ignore_errors=True)
+            ret = MediaProcessor._run([
+                "ffmpeg", "-y", "-i", video_path,
+                "-map", "v:0", "-frames:v", "1", "-update", "1",
+                "-q:v", "2", output_image_path,
+            ], timeout=120)
+            if os.path.exists(output_image_path) and os.path.getsize(output_image_path) > 0:
+                return output_image_path
+            logger.error("Failed to read frame from %s (%s)", video_path, ret.stderr[-300:])
             return None
-        finally:
-            cap.release()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+            logger.error("Frame extraction failed for %s: %s", video_path, e)
+            return None
 
     @staticmethod
     def extract_thumbnail(video_path: str, output_image_path: str, width: int = 320) -> Optional[str]:
         """Save a small JPEG thumbnail (first frame) for GUI previews."""
-        cap = cv2.VideoCapture(video_path)
         try:
-            if not cap.isOpened():
-                return None
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                return None
-            h, w = frame.shape[:2]
-            if w > width:
-                frame = cv2.resize(frame, (width, max(1, int(h * width / w))))
-            if cv2.imwrite(output_image_path, frame):
+            MediaProcessor._run([
+                "ffmpeg", "-y", "-i", video_path,
+                "-map", "v:0", "-frames:v", "1",
+                "-vf", f"scale={width}:-2", "-q:v", "5", output_image_path,
+            ], timeout=60)
+            if os.path.exists(output_image_path) and os.path.getsize(output_image_path) > 0:
                 return output_image_path
             return None
-        finally:
-            cap.release()
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+            logger.error("Thumbnail extraction failed for %s: %s", video_path, e)
+            return None
 
     @staticmethod
     def _probe_video(path: str) -> Optional[dict]:
-        """Return {w, h, fps} metadata of a video file, or None on failure."""
-        cap = cv2.VideoCapture(path)
+        """Return {w, h, fps} metadata of a video file via ffprobe, or None."""
         try:
-            if not cap.isOpened():
+            proc = MediaProcessor._run([
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,r_frame_rate",
+                "-of", "json", path,
+            ], timeout=60)
+            data = json.loads(proc.stdout or "{}")
+            streams = data.get("streams") or []
+            if not streams:
                 return None
-            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+            s = streams[0]
+            w, h = int(s.get("width") or 0), int(s.get("height") or 0)
+            rate = s.get("r_frame_rate") or "24/1"
+            num, _, den = rate.partition("/")
+            try:
+                fps = float(num) / float(den or 1)
+            except (ValueError, ZeroDivisionError):
+                fps = 24.0
             if w <= 0 or h <= 0:
                 return None
-            return {"w": w, "h": h, "fps": float(fps)}
-        finally:
-            cap.release()
+            return {"w": w, "h": h, "fps": fps if fps > 0 else 24.0}
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+                OSError, ValueError, json.JSONDecodeError) as e:
+            logger.error("ffprobe failed for %s: %s", path, e)
+            return None
 
     @staticmethod
     def normalize_clip(path: str, target_w: int, target_h: int, target_fps: float) -> Optional[str]:
@@ -395,31 +433,33 @@ class MediaProcessor:
         out_path = os.path.join(
             os.path.dirname(path), "_norm_" + os.path.basename(path)
         )
-        clip = None
+        # Preserve aspect ratio: scale to fit inside the target canvas,
+        # then pad with black (force even dimensions for libx264).
+        vf = (
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2:color=black,"
+            f"fps={target_fps:.6f}"
+        )
         try:
-            clip = VideoFileClip(path)
-            # Preserve aspect ratio: scale to fit, then pad to the target canvas.
-            r = min(target_w / meta["w"], target_h / meta["h"])
-            new_w, new_h = max(2, int(meta["w"] * r) // 2 * 2), max(2, int(meta["h"] * r) // 2 * 2)
-            resized = clip.resized(height=new_h, width=new_w)
-            left = (target_w - new_w) // 2
-            top = (target_h - new_h) // 2
-            final = resized.on_color(
-                size=(target_w, target_h), color=(0, 0, 0),
-                pos=(max(0, left), max(0, top)),
-            )
-            final.write_videofile(out_path, fps=target_fps, codec="libx264", audio_codec="aac", logger=None)
+            MediaProcessor._run([
+                "ffmpeg", "-y", "-i", path,
+                "-vf", vf,
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                out_path,
+            ])
+            if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+                raise RuntimeError("ffmpeg produced no output")
             logger.info("Normalized %s -> %dx%d@%.2ffps", os.path.basename(path), target_w, target_h, target_fps)
             return out_path
-        except Exception as e:  # noqa: BLE001
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, RuntimeError) as e:
             logger.error("Normalization failed for %s: %s", path, e)
-            return None
-        finally:
-            if clip is not None:
+            if os.path.exists(out_path):
                 try:
-                    clip.close()
-                except Exception:  # noqa: BLE001
+                    os.remove(out_path)
+                except OSError:
                     pass
+            return None
 
     @staticmethod
     def concatenate_videos(video_paths: list[str], output_filename: str) -> Optional[str]:
@@ -428,13 +468,12 @@ class MediaProcessor:
         Veo can return clips with differing resolution/FPS (e.g. after an
         upscale or across model revisions); concatenating such streams
         produces desynchronized output. All clips are therefore re-encoded
-        to the geometry of the first clip before stitching. Handles are
-        always released, even on error.
+        to the geometry of the first clip, then stitched with the ffmpeg
+        concat demuxer (bit-exact join of identically-encoded streams).
         """
         logger.info("Concatenating %d videos...", len(video_paths))
-        clips: list[VideoFileClip] = []
-        final_clip: Optional[VideoFileClip] = None
         normalized_files: list[str] = []
+        list_file: Optional[str] = None
         try:
             metas = [MediaProcessor._probe_video(p) for p in video_paths]
             if any(m is None for m in metas):
@@ -456,29 +495,37 @@ class MediaProcessor:
                     normalized_files.append(norm)
                 use_paths.append(norm)
 
-            clips = [VideoFileClip(path) for path in use_paths]
-            final_clip = concatenate_videoclips(clips)
-            final_clip.write_videofile(output_filename, codec="libx264", audio_codec="aac", logger=None)
+            # Write a concat-list file (single-quoted paths escaped).
+            fd, list_file = tempfile.mkstemp(prefix="veo_concat_", suffix=".txt",
+                                             dir=os.path.dirname(os.path.abspath(output_filename)))
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                for up in use_paths:
+                    safe = os.path.abspath(up).replace("'", "'\\''")
+                    fh.write(f"file '{safe}'\n")
+
+            MediaProcessor._run([
+                "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", list_file,
+                "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", output_filename,
+            ])
+            if not os.path.exists(output_filename) or os.path.getsize(output_filename) == 0:
+                raise RuntimeError("ffmpeg produced no concatenated output")
             logger.info("Combined video saved: %s", output_filename)
             return output_filename
         except Exception as e:  # noqa: BLE001 - report and degrade gracefully
             logger.error("Video concatenation failed: %s", e)
             return None
         finally:
-            if final_clip is not None:
-                try:
-                    final_clip.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            for clip in clips:
-                try:
-                    clip.close()
-                except Exception:  # noqa: BLE001
-                    pass
             for nf in normalized_files:
                 try:
                     if os.path.exists(nf):
                         os.remove(nf)
+                except OSError:
+                    pass
+            if list_file is not None:
+                try:
+                    if os.path.exists(list_file):
+                        os.remove(list_file)
                 except OSError:
                     pass
 
