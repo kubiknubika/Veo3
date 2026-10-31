@@ -4,7 +4,24 @@ Advanced AI Media Generation tool powered by Google Gemini (Veo 3.1, Imagen 4, L
 
 ## 🚀 Installation & Setup
 
-1.  **Prerequisites**: Python 3.10+ installed.
+### Windows (recommended — one-click launch)
+
+1.  Install [Python 3.10+](https://www.python.org/downloads/) and **tick "Add python.exe to PATH"** during installation.
+2.  **Double-click `run.bat`** — that's it. On the first launch the script automatically:
+    *   finds Python, creates a `.venv` virtual environment;
+    *   installs all dependencies from `requirements.txt`;
+    *   starts the GUI. Every subsequent launch is instant.
+3.  Set up your API key: copy `.env.example` to `.env` (in Explorer just rename it and remove the leading name) and put your key inside:
+    ```env
+    GEMINI_API_KEY=your_google_api_key_here
+    ```
+    Get a free key at [Google AI Studio](https://aistudio.google.com/apikey). If the key is missing, `run.bat` will remind you how to create it.
+
+> 💡 ffmpeg is required for video stitching/frames. Install it with `winget install Gyan.FFmpeg` (or download from ffmpeg.org and add to PATH).
+
+### Any OS (manual setup)
+
+1.  **Prerequisites**: Python 3.10+ and ffmpeg installed.
 2.  **Clone the repository**:
     ```bash
     git clone https://github.com/kubiknubika/Veo3.git
@@ -15,20 +32,27 @@ Advanced AI Media Generation tool powered by Google Gemini (Veo 3.1, Imagen 4, L
     pip install -r requirements.txt
     ```
 4.  **Environment Setup**:
-    Create a `.env` file in the root directory and add your API key:
+    Create a `.env` file in the root directory (or copy `.env.example`) and add your API key:
     ```env
     GEMINI_API_KEY=your_google_api_key_here
     ```
 
 ## ▶️ Usage
 
-Run the main application using Python:
+**Windows:** just double-click **`run.bat`** (GUI) or use **`cli.bat`** for the command line:
 
 ```powershell
-python veo_generator.py
+cli.bat                              # interactive menu
+cli.bat video "a cat surfing waves"  # generate a single video
+cli.bat tasks                        # show task journal
 ```
 
-*Note: You may want to create a `run.bat` or `run.sh` script locally to execute this with your specific Python environment path if needed.*
+**Any OS:** run the application with Python directly:
+
+```bash
+python veo_gui.py         # GUI
+python veo_generator.py   # CLI / interactive menu
+```
 
 ## ✨ Features
 

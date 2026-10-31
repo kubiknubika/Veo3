@@ -791,6 +791,19 @@ class VeoGUIApp:
 
 
 def main() -> None:
+    # Fail fast with a readable console message instead of opening a GUI
+    # window that cannot generate anything (Windows users double-click
+    # run.bat, where the console stays visible).
+    try:
+        validate_api_key()
+    except ApiKeyError as e:
+        print(f"Configuration error: {e}", file=sys.stderr)
+        print(
+            'Tip: copy .env.example to .env and set GEMINI_API_KEY '
+            '(get a key at https://aistudio.google.com/apikey).',
+            file=sys.stderr,
+        )
+        sys.exit(2)
     ft.run(VeoGUIApp)
 
 
