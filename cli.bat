@@ -34,10 +34,16 @@ if not exist "%VPY%" (
 )
 :venv_ready
 
+rem Optional accelerator: uv inside the venv (drop-in pip replacement, ~5-10x faster)
+set "PIP=%VPY% -m pip"
+"%VPY%" -m pip install uv >nul 2>nul
+"%VPY%" -m uv --help >nul 2>nul
+if not errorlevel 1 set "PIP=%VPY% -m uv pip"
+
 "%VPY%" -c "import google.genai, PIL, dotenv" >nul 2>nul
 if not errorlevel 1 goto :deps_ready
 echo [SETUP] Installing dependencies...
-"%VPY%" -m pip install -r requirements.txt
+"%PIP%" install -r requirements.txt
 if errorlevel 1 (
     echo [ERROR] Dependency installation failed. Check your internet connection.
     pause

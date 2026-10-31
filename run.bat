@@ -53,6 +53,14 @@ if not exist ".venv\Scripts\python.exe" (
 
 set "VPY=.venv\Scripts\python.exe"
 
+rem ---------- Speed up first-time installs with uv (optional) ----------
+rem uv is a drop-in pip replacement that installs the same packages ~5-10x
+rem faster. It is installed inside the .venv only - nothing touches the system.
+set "PIP=%VPY% -m pip"
+"%VPY%" -m pip install uv >nul 2>nul
+"%VPY%" -m uv --help >nul 2>nul
+if not errorlevel 1 set "PIP=%VPY% -m uv pip"
+
 rem ---------- Install dependencies when missing or requirements.txt changed ----------
 set "NEED_INSTALL="
 for /f "usebackq delims=" %%H in (`"%VPY%" -c "import hashlib;print(hashlib.sha256(open('requirements.txt','rb').read()).hexdigest()[:16])" 2^>nul`) do set "REQHASH=%%H"
@@ -65,8 +73,8 @@ if defined REQHASH (
 )
 if defined NEED_INSTALL (
     echo [SETUP] Installing dependencies - this may take a few minutes...
-    "%VPY%" -m pip install --upgrade pip >nul 2>nul
-    "%VPY%" -m pip install -r requirements.txt
+    "%PIP%" install --upgrade pip >nul 2>nul
+    "%PIP%" install -r requirements.txt
     if errorlevel 1 (
         echo [ERROR] Dependency installation failed. Check your internet connection.
         pause
