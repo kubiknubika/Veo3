@@ -47,6 +47,7 @@ Advanced AI Media Generation tool powered by Google Gemini (Veo 3.1, Imagen 4, L
 | **`VeoGUI.vbs`** | Double-click GUI with **no console window** (uses `pythonw.exe`). First run still shows the setup console via `run.bat`. Right-click → *Send to → Desktop* to get a normal-looking shortcut. |
 | **`run-hidden.ps1`** | Same silent launch in PowerShell: `powershell -ExecutionPolicy Bypass -File run-hidden.ps1` (only needed if Windows blocks `.vbs` execution via AppLocker/WDAC). |
 | **`cli.bat`** | Command-line mode with arguments. |
+| **`build-exe.bat`** | Builds a standalone `dist\VeoGenerator\VeoGenerator.exe` (see below). Needs Python only on the *building* machine. |
 
 To use it **like an installed app**: right-click `VeoGUI.vbs` (or `run.bat`) → *Send to → Desktop (create shortcut)*, then rename the shortcut to "Veo3 Generator" and pin it to the taskbar/Start.
 
@@ -64,7 +65,7 @@ $s.Save()
 
 The `.lnk` is a few hundred bytes and points at the repo folder; if you move the repo, recreate it.
 
-**Standalone .exe (no Python needed on the target PC)** — build once on any Windows machine where you already ran `run.bat`:
+**Standalone .exe (no Python needed on the target PC)** — double-click **`build-exe.bat`** on your Windows machine. It reuses/creates `.venv`, installs PyInstaller into it and packages the app with `veo.spec`. Manual equivalent:
 
 ```powershell
 .venv\Scripts\pip install pyinstaller
