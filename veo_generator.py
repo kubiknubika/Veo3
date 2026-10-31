@@ -46,12 +46,14 @@ class CancelledError(RuntimeError):
 # Load environment variables from .env (config lives outside the code).
 # Explicit path: double-clicked launchers (.vbs / desktop shortcut) may start
 # with an unrelated working directory, and a frozen PyInstaller build has no
-# __file__ — resolve relative to the executable instead.
+# __file__ — resolve relative to the executable instead. The GUI can also
+# save a key at runtime via set_api_key(), which writes the same file.
 if getattr(sys, "frozen", False):
     _ENV_BASE = os.path.dirname(sys.executable)
 else:
     _ENV_BASE = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(_ENV_BASE, ".env"))
+ENV_FILE = os.path.join(_ENV_BASE, ".env")
+load_dotenv(ENV_FILE)
 
 logger = logging.getLogger("veo")
 
@@ -130,17 +132,26 @@ class ApiKeyError(RuntimeError):
     """Raised when the GEMINI_API_KEY is missing or obviously invalid."""
 
 
-def validate_api_key() -> str:
+_key_lock = threading.Lock()
+
+
+def get_api_key() -> str:
+    """Return the currently configured API key ("" if unset)."""
+    return (os.environ.get("GEMINI_API_KEY") or "").strip()
+
+
+def validate_api_key(key: Optional[str] = None) -> str:
     """Return the API key or raise :class:`ApiKeyError` early at startup.
 
-    Performs an offline format check (Google AI Studio keys are 35+ chars
-    starting with ``AIza``); a live network validation is issued lazily by
-    the first API call so no extra quota is spent on startup.
+    Performs an offline format check only (Google AI Studio keys are 35+
+    chars starting with ``AIza``); use :func:`check_api_key_connectivity`
+    for a live network validation that costs no quota.
     """
-    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    key = get_api_key() if key is None else (key or "").strip()
     if not key:
         raise ApiKeyError(
-            "GEMINI_API_KEY is not set. Create a .env file with GEMINI_API_KEY=your_key"
+            "GEMINI_API_KEY is not set. Enter it in the GUI (Settings/API-key "
+            "dialog) or create a .env file with GEMINI_API_KEY=your_key"
         )
     placeholders = ("your_", "placeholder", "xxx", "changeme", "insert")
     if any(p in key.lower() for p in placeholders) or len(key) < 20:
@@ -153,6 +164,89 @@ def validate_api_key() -> str:
             f"GEMINI_API_KEY has an invalid length ({len(key)}); "
             "Google API keys are 35+ characters. Check for truncation."
         )
+    return key
+
+
+def check_api_key_connectivity(key: str, timeout_s: float = 15.0) -> tuple[bool, str]:
+    """Live-check a Google AI Studio key against the Generative Language API.
+
+    Issues one REST *listing* request (no model inference), so validation
+    consumes zero generation quota. Returns ``(ok, message)`` and never
+    raises — callers decide what to do with the verdict.
+    """
+    import json as _json
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    url = ("https://generativelanguage.googleapis.com/v1beta/models?"
+           + urllib.parse.urlencode({"pageSize": "1", "key": key}))
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Veo3ProGenerator"})
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read(4096)
+        try:
+            data = _json.loads(body.decode("utf-8", "replace") or "{}")
+        except ValueError:
+            data = {}
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"]
+            return False, str(err.get("message") or "API returned an error").strip()
+        return True, "Ключ рабочий: запрос к API выполнен успешно."
+    except urllib.error.HTTPError as e:
+        msg = ""
+        try:
+            err = _json.loads(e.read().decode("utf-8", "replace")).get("error", {})
+            msg = str(err.get("message") or "").strip()
+        except Exception:  # noqa: BLE001 - response may not be JSON
+            pass
+        if e.code == 400 and "API key not valid" in msg:
+            return False, "Google отклонил ключ: «API key not valid». Проверьте, что скопировали ключ целиком."
+        if e.code in (401, 403):
+            return False, msg or f"Доступ запрещён (HTTP {e.code})."
+        if e.code == 429:
+            # Rate-limited but the key itself was accepted.
+            return True, "Ключ принят API (в момент проверки — лимит запросов 429)."
+        return False, msg or f"Ошибка HTTP {e.code}."
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        return False, f"Нет связи с Google API: {getattr(e, 'reason', e)}"
+
+
+def set_api_key(key: str, persist: bool = True) -> str:
+    """Install ``key`` as the active GEMINI_API_KEY (validated first).
+
+    When ``persist`` is true the key is also written to the .env file next
+    to the app/executable so the program remembers it on the next launch.
+    Returns the validated key; raises :class:`ApiKeyError` on bad input.
+    """
+    key = validate_api_key(key)
+    os.environ["GEMINI_API_KEY"] = key
+    if persist:
+        with _key_lock:
+            lines: list[str] = []
+            if os.path.exists(ENV_FILE):
+                try:
+                    with open(ENV_FILE, "r", encoding="utf-8") as fh:
+                        lines = fh.readlines()
+                except OSError:
+                    lines = []
+            replaced = False
+            out_lines: list[str] = []
+            for ln in lines:
+                stripped = ln.strip()
+                if stripped.startswith("GEMINI_API_KEY") or stripped.startswith("# GEMINI_API_KEY"):
+                    if not replaced:
+                        out_lines.append(f"GEMINI_API_KEY={key}\n")
+                        replaced = True
+                    continue
+                out_lines.append(ln if ln.endswith("\n") else ln + "\n")
+            if not replaced:
+                out_lines.insert(0, f"GEMINI_API_KEY={key}\n")
+            try:
+                with open(ENV_FILE, "w", encoding="utf-8") as fh:
+                    fh.writelines(out_lines)
+            except OSError as e:
+                logger.warning("Could not persist API key to %s: %s", ENV_FILE, e)
     return key
 
 
@@ -540,6 +634,43 @@ class MediaProcessor:
 # --- Generative AI Service ---
 
 
+def _friendly_api_error(e: Exception) -> str:
+    """Translate a raw google-genai exception into an actionable message.
+
+    The GUI shows this text in its log; without it users only ever see
+    "Generation failed or cancelled" with no clue why (bad key, missing
+    billing quota, unsupported parameter, ...).
+    """
+    code = getattr(e, "code", None)
+    if code is None:
+        resp = getattr(e, "response", None)
+        code = getattr(resp, "status_code", None)
+    try:
+        code_i = int(code) if code is not None else None
+    except (TypeError, ValueError):
+        code_i = None
+    text = str(e)
+    low = text.lower()
+
+    if code_i in (401, 403) or "api key not valid" in low or "permission denied" in low:
+        return ("API-ключ отклонён Google (401/403). Проверьте ключ в окне «API Key» "
+                "(https://aistudio.google.com/apikey) и нажмите «Проверить». "
+                f"Детали: {text}")
+    if code_i == 429 or "quota" in low or "rate limit" in low:
+        return ("Лимит запросов/квоты исчерпан (429). Бесплатный тариф не поддерживает "
+                f"Veo — нужен платный план. Детали: {text}")
+    if code_i == 400 or "invalid argument" in low:
+        return ("Google отклонил параметры запроса (400). Частые причины: модель Veo "
+                "недоступна для этого ключа/тарифа, неверное разрешение или длительность. "
+                f"Детали: {text}")
+    if "not found" in low and "model" in low:
+        return ("Модель не найдена для этого ключа. Убедитесь, что Veo включена в "
+                f"AI Studio, или задайте VEO_MODEL_VIDEO в .env. Детали: {text}")
+    if isinstance(e, (TimeoutError,)) or "timeout" in low:
+        return f"Таймаут обращения к API. Повторите позже. Детали: {text}"
+    return f"Ошибка API ({type(e).__name__}): {text}"
+
+
 class GenAIService:
     """Thin, resilient wrapper around the Google GenAI client."""
 
@@ -550,6 +681,16 @@ class GenAIService:
         self.cancel_event: threading.Event = threading.Event()
         # JSONL task journal (statistics / observability).
         self._journal = TaskJournal(Config.TASKS_JOURNAL_FILE)
+
+    def set_api_key(self, key: str, persist: bool = True) -> str:
+        """Swap the live API key at runtime (validated + optionally saved).
+
+        Rebuilds the underlying GenAI client so subsequent calls use the
+        new credentials without restarting the app.
+        """
+        self.api_key = set_api_key(key, persist=persist)
+        self.client = genai.Client(api_key=self.api_key)
+        return self.api_key
 
     def cancel(self) -> None:
         """Request cancellation of the current generation/polling loop."""
@@ -788,13 +929,27 @@ class GenAIService:
                     logger.warning("person_generation argument rejected; retrying without it...")
                     config_params.pop("person_generation", None)
                     operation = self._retry(lambda: submit(config_params), "Video request (fallback)")
+                elif "resolution" in err_str.lower() or "unsupported" in err_str.lower():
+                    # Free-tier / older keys reject 1080p/4k — degrade to 720p once.
+                    logger.warning("Request rejected (resolution/model params); retrying at 720p...")
+                    config_params["resolution"] = "720p"
+                    operation = self._retry(lambda: submit(config_params), "Video request (720p fallback)")
                 else:
                     raise
 
             logger.info("Waiting for generation to finish...")
             self._await_operation(operation, progress_cb=progress_cb)
 
-            generated_video = operation.response.generated_videos[0]
+            resp = getattr(operation, "response", None) or operation
+            videos = list(getattr(resp, "generated_videos", None) or [])
+            if not videos:
+                rmeta = getattr(resp, "generation_progress_metadata", None)
+                failure = getattr(rmeta, "failure_message", None) if rmeta else None
+                raise RuntimeError(
+                    f"API вернул пустой результат генерации{': ' + str(failure) if failure else ''}. "
+                    "Частые причины: политика безопасности (персоны), квота или неподдерживаемые параметры."
+                )
+            generated_video = videos[0]
             self.client.files.download(file=generated_video.video)
             generated_video.video.save(output_filename)
             logger.info("Video saved: %s", output_filename)
@@ -808,8 +963,9 @@ class GenAIService:
                                  duration_s=time.time() - start)
             raise
         except Exception as e:  # noqa: BLE001
-            logger.error("Video generation failed: %s", e)
-            self._journal.record("video", "failed", prompt=prompt, error=str(e),
+            friendly = _friendly_api_error(e)
+            logger.error("Video generation failed: %s\n%s", e, friendly)
+            self._journal.record("video", "failed", prompt=prompt, error=friendly,
                                  duration_s=time.time() - start)
             return None
 
@@ -1000,6 +1156,7 @@ class GenerationOrchestrator:
         reference_image_paths: Optional[list[str]] = None,
         generate_audio: bool = True,
         upsampling: Optional[bool] = None,
+        on_error: Optional[Callable[[str], None]] = None,
     ) -> Optional[str]:
         self.ai.reset_cancel()
         start = time.time()
@@ -1022,6 +1179,10 @@ class GenerationOrchestrator:
                 negative_prompt = self.ai.generate_negative_prompt(prompt)
                 if negative_prompt:
                     self.log(f"Negative prompt: {negative_prompt}")
+                elif on_error:
+                    # Not fatal, but tell the user why it is missing.
+                    on_error("Негативный промпт не сгенерирован (LLM недоступен) — "
+                             "генерация продолжена без него.")
 
             if output_filename is None:
                 output_filename = FileManager.get_unique_filename(Config.OUTPUT_DIRS["video"], "veo_video", ".mp4")
@@ -1045,6 +1206,14 @@ class GenerationOrchestrator:
             )
             status = "ok" if out else "failed"
             return out
+        except CancelledError:
+            status = "cancelled"
+            raise
+        except Exception as e:  # noqa: BLE001 - surface a readable reason to the UI
+            status = "failed"
+            if on_error:
+                on_error(_friendly_api_error(e))
+            return None
         finally:
             self._report_progress(100 if out else None, "done" if out else "stopped")
             self.ai._journal.record("task_video", status, prompt=prompt, output=out,
