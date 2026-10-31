@@ -1,6 +1,7 @@
 # Veo3 Pro Generator - hidden GUI launcher (PowerShell variant).
-# Run: powershell -ExecutionPolicy Bypass -File run-hidden.ps1
-# (or double-click VeoGUI.vbs, which is simpler for non-technical users)
+# Run from a terminal:
+#   powershell -ExecutionPolicy Bypass -File run-hidden.ps1
+# Prefer double-clicking VeoGUI.vbs - simpler for non-technical users.
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 

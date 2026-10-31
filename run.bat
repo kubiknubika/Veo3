@@ -19,7 +19,7 @@ if defined PYLAUNCHER (
     rem Try the newest interpreters first, require 3.10+
     for %%V in (3.13 3.12 3.11 3.10) do (
         if not defined PYTHON (
-            py -%%V -c "pass" >nul 2>nul && set "PYTHON=py -%%V"
+            py -%%V -c "import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)" >nul 2>nul && set "PYTHON=py -%%V"
         )
     )
 )
@@ -53,9 +53,17 @@ if not exist ".venv\Scripts\python.exe" (
 
 set "VPY=.venv\Scripts\python.exe"
 
-rem ---------- Install dependencies when out of date ----------
-"%VPY%" -c "import google.genai, PIL, dotenv, flet" >nul 2>nul
-if errorlevel 1 (
+rem ---------- Install dependencies when missing or requirements.txt changed ----------
+set "NEED_INSTALL="
+for /f "usebackq delims=" %%H in (`"%VPY%" -c "import hashlib;print(hashlib.sha256(open('requirements.txt','rb').read()).hexdigest()[:16])" 2^>nul`) do set "REQHASH=%%H"
+if defined REQHASH (
+    if not exist ".venv\.deps_stamp" set "NEED_INSTALL=1"
+    findstr /x /c:"%REQHASH%" ".venv\.deps_stamp" >nul 2>nul || set "NEED_INSTALL=1"
+) else (
+    rem Fallback for unusual setups where the probe cannot run: import check only
+    "%VPY%" -c "import google.genai, PIL, dotenv, flet" >nul 2>nul || set "NEED_INSTALL=1"
+)
+if defined NEED_INSTALL (
     echo [SETUP] Installing dependencies - this may take a few minutes...
     "%VPY%" -m pip install --upgrade pip >nul 2>nul
     "%VPY%" -m pip install -r requirements.txt
@@ -64,6 +72,7 @@ if errorlevel 1 (
         pause
         exit /b 1
     )
+    if defined REQHASH (echo %REQHASH%> ".venv\.deps_stamp")
 )
 
 rem ---------- Warn if API key is missing ----------
@@ -89,9 +98,9 @@ if errorlevel 1 (
 rem ---------- Launch ----------
 echo [RUN] Starting Veo3 Pro Generator...
 "%VPY%" veo_gui.py
-if errorlevel 1 (
-    echo.
-    echo [ERROR] The application exited with an error code %errorlevel%.
-    pause
-)
+if not errorlevel 1 goto :launch_ok
+echo.
+echo [ERROR] The application exited with an error (code above).
+pause
+:launch_ok
 endlocal
