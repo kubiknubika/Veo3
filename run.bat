@@ -127,6 +127,8 @@ set "VIRTUAL_ENV="
 for %%P in ("%VPY%") do set "VIRTUAL_ENV=%%~dpP.."
 "%UVEXE%" pip --help >nul 2>nul || exit /b 0
 set "PIP="%UVEXE%" pip"
+rem Suppress uv hardlink warning when cache and venv live on different filesystems.
+set "UV_LINK_MODE=copy"
 exit /b 0
 
 :install_deps
